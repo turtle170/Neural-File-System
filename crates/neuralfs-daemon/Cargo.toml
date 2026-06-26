@@ -1,0 +1,23 @@
+[package]
+name = "neuralfs-daemon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "neuralfs"
+path = "src/main.rs"
+
+[dependencies]
+notify = "6"
+sled = "0.34"
+bincode = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+walkdir = "2"
+ndarray = { version = "0.15", features = ["serde"] }
+chrono = { version = "0.4", features = ["clock"] }
+log = { version = "0.4", features = ["std"] }
+dirs = "5"
+anyhow = "1"
+toml = "0.8"
