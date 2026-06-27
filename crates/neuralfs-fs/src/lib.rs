@@ -4,9 +4,11 @@
 //! filesystem — ZFS-like integrity and snapshots without the weight.
 
 mod blockstore;
+mod cache;
 mod fs;
 mod inode;
 
 pub use blockstore::{hash_hex, Hash, BLOCK_SIZE};
-pub use fs::{Filesystem, FsInfo};
+pub use cache::{CacheStats, RamCache};
+pub use fs::{Filesystem, FsInfo, DEFAULT_CACHE_BYTES};
 pub use inode::{Inode, Stat, SuperBlock};

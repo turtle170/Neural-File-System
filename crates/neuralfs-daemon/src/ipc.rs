@@ -339,6 +339,21 @@ async fn handle_request(
             ])
         }
 
+        // ---- RAM cache (ARC) stats --------------------------------------
+        Request::Cache => {
+            let s = state.vfs.cache_stats();
+            let mib = |b: u64| format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0));
+            lines(vec![
+                format!("cap:             {}", mib(s.cap_bytes)),
+                format!("resident:        {}", mib(s.resident_bytes)),
+                format!("entries:         {} (protected {}, probation {})", s.entries, s.protected_entries, s.probation_entries),
+                format!("hits / misses:   {} / {}", s.hits, s.misses),
+                format!("hit rate:        {:.1}%", s.hit_rate() * 100.0),
+                format!("promotions:      {}", s.promotions),
+                format!("evictions:       {}", s.evictions),
+            ])
+        }
+
         // ---- benchmark ---------------------------------------------------
         Request::Bench { mb } => {
             let vfs = state.vfs.clone();
@@ -411,10 +426,17 @@ fn run_bench(vfs: &neuralfs_fs::Filesystem, mb: usize) -> Result<Vec<String>> {
     let mb = mb.clamp(1, 1024);
     let total = mb * 1024 * 1024;
     let mut payload = vec![0u8; total];
-    // Fill with a non-repeating pattern (Knuth multiplicative) so every 64 KiB
-    // block is distinct and the block store cannot dedup it away.
-    for (i, b) in payload.iter_mut().enumerate() {
-        *b = (((i as u64).wrapping_mul(2654435761)) >> 13) as u8;
+    // Fill with a long-period xorshift64 stream so every 64 KiB block is
+    // genuinely distinct — otherwise content-addressed dedup would collapse
+    // the payload and the throughput number would be a lie.
+    let mut x: u64 = 0x9E3779B97F4A7C15;
+    let mut i = 0;
+    while i + 8 <= total {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        payload[i..i + 8].copy_from_slice(&x.to_le_bytes());
+        i += 8;
     }
 
     let t0 = Instant::now();
@@ -422,18 +444,22 @@ fn run_bench(vfs: &neuralfs_fs::Filesystem, mb: usize) -> Result<Vec<String>> {
     vfs.flush()?;
     let write_s = t0.elapsed().as_secs_f64();
 
+    // This read is served from the RAM cache (data was just written), so it
+    // measures cache + checksum-verify throughput, not cold disk read.
     let t1 = Instant::now();
     let read_back = vfs.read_file("/_bench/data.bin")?;
     let read_s = t1.elapsed().as_secs_f64();
 
     let ok = read_back.len() == payload.len();
+    let unique_blocks = vfs.info().map(|fsi| fsi.unique_blocks).unwrap_or(0);
     let _ = vfs.remove("/_bench");
 
     let mbf = mb as f64;
     Ok(vec![
-        format!("payload:        {mb} MiB ({total} bytes, unique blocks)"),
-        format!("write:          {:.3} s  ->  {:.1} MB/s", write_s, mbf / write_s),
-        format!("read+verify:    {:.3} s  ->  {:.1} MB/s", read_s, mbf / read_s),
-        format!("integrity:      {}", if ok { "verified" } else { "MISMATCH" }),
+        format!("payload:            {mb} MiB ({total} bytes)"),
+        format!("unique blocks:      {unique_blocks} (dedup-resistant fill)"),
+        format!("write (to disk):    {:.3} s  ->  {:.1} MB/s", write_s, mbf / write_s),
+        format!("read (cache-warm):  {:.3} s  ->  {:.1} MB/s", read_s, mbf / read_s),
+        format!("integrity:          {}", if ok { "verified" } else { "MISMATCH" }),
     ])
 }

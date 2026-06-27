@@ -1,14 +1,20 @@
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use anyhow::{bail, Context, Result};
+use hashlink::LruCache;
 use parking_lot::Mutex;
 
 use crate::blockstore::{BlockStore, BLOCK_SIZE};
+use crate::cache::CacheStats;
 use crate::inode::{Inode, Stat, SuperBlock};
 
-const DEFAULT_CACHE_BLOCKS: usize = 4096; // ~256 MiB hot set at 64 KiB blocks
+/// Default RAM budget for the block cache: a strict 1 GiB, ZFS-ARC style.
+pub const DEFAULT_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
+/// Number of (immutable) inodes kept hot in RAM to avoid sled reads.
+const INODE_CACHE_ENTRIES: usize = 65_536;
 
 /// A lightweight copy-on-write, content-addressed filesystem.
 ///
@@ -18,7 +24,8 @@ const DEFAULT_CACHE_BLOCKS: usize = 4096; // ~256 MiB hot set at 64 KiB blocks
 ///
 /// Design goals (ZFS-like, but lighter): end-to-end blake3 checksums,
 /// copy-on-write with an atomic root swap per transaction, O(1) snapshots,
-/// transparent block-level dedup, and an LRU block cache for speed.
+/// transparent block-level dedup, a strict-capped frequency-aware RAM block
+/// cache, and an immutable-inode cache so hot metadata never touches disk.
 pub struct Filesystem {
     blocks: BlockStore,
     db: sled::Db,
@@ -26,14 +33,17 @@ pub struct Filesystem {
     super_tree: sled::Tree,
     snapshots: sled::Tree,
     state: Mutex<SuperBlock>,
+    /// Inodes are immutable once written (CoW allocates a new id per change),
+    /// so caching them by id never goes stale.
+    inode_cache: Mutex<LruCache<u64, Arc<Inode>>>,
 }
 
 impl Filesystem {
     pub fn open(dir: &Path) -> Result<Self> {
-        Self::open_with_cache(dir, DEFAULT_CACHE_BLOCKS)
+        Self::open_with_cache(dir, DEFAULT_CACHE_BYTES)
     }
 
-    pub fn open_with_cache(dir: &Path, cache_blocks: usize) -> Result<Self> {
+    pub fn open_with_cache(dir: &Path, cache_bytes: u64) -> Result<Self> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("creating fs dir {}", dir.display()))?;
         let db = sled::Config::new()
@@ -44,7 +54,7 @@ impl Filesystem {
         let inodes = db.open_tree("inodes")?;
         let super_tree = db.open_tree("super")?;
         let snapshots = db.open_tree("snapshots")?;
-        let blocks = BlockStore::open(&dir.join("data.log"), block_index, cache_blocks)?;
+        let blocks = BlockStore::open(&dir.join("data.log"), block_index, cache_bytes)?;
 
         let state = match super_tree.get("root")? {
             Some(v) => bincode::deserialize(&v)?,
@@ -73,7 +83,13 @@ impl Filesystem {
             super_tree,
             snapshots,
             state: Mutex::new(state),
+            inode_cache: Mutex::new(LruCache::new(INODE_CACHE_ENTRIES)),
         })
+    }
+
+    /// Block-cache statistics (resident bytes, hit rate, promotions, ...).
+    pub fn cache_stats(&self) -> CacheStats {
+        self.blocks.cache_stats()
     }
 
     // ---- public filesystem API ------------------------------------------
@@ -385,15 +401,21 @@ impl Filesystem {
     }
 
     fn read_inode(&self, id: u64) -> Result<Inode> {
+        if let Some(a) = self.inode_cache.lock().get(&id) {
+            return Ok((**a).clone());
+        }
         let v = self
             .inodes
             .get(id_key(id))?
             .with_context(|| format!("dangling inode {id}"))?;
-        Ok(bincode::deserialize(&v)?)
+        let inode: Inode = bincode::deserialize(&v)?;
+        self.inode_cache.lock().insert(id, Arc::new(inode.clone()));
+        Ok(inode)
     }
 
     fn put_inode(&self, id: u64, inode: &Inode) -> Result<()> {
         self.inodes.insert(id_key(id), bincode::serialize(inode)?)?;
+        self.inode_cache.lock().insert(id, Arc::new(inode.clone()));
         Ok(())
     }
 

@@ -8,6 +8,6 @@ blake3 = "1"
 sled = "0.34"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
-lru = "0.12"
+hashlink = "0.9"
 parking_lot = "0.12"
 anyhow = "1"

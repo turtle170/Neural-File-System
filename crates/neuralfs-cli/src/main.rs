@@ -42,6 +42,8 @@ enum Command {
     },
     /// Show the continuously-updated AI model status
     Ai,
+    /// Show RAM cache (ZFS-ARC-style, 1 GiB cap) statistics
+    Cache,
     /// Benchmark virtual filesystem throughput (write/read MB/s)
     Bench {
         /// Payload size in MiB
@@ -151,6 +153,7 @@ async fn run(cli: Cli) -> Result<()> {
             None => print_lines(&client::send(Request::HookStatus).await?),
         },
         Command::Ai => print_lines(&client::send(Request::Ai).await?),
+        Command::Cache => print_lines(&client::send(Request::Cache).await?),
         Command::Bench { mb } => print_lines(&client::send(Request::Bench { mb }).await?),
     }
     Ok(())

@@ -24,3 +24,10 @@ log = { version = "0.4", features = ["std"] }
 dirs = "5"
 anyhow = "1"
 toml = "0.8"
+
+# FUSE user-mode filesystem hook (Linux/WSL only). Enable with --features fuse.
+fuser = { version = "0.14", optional = true, default-features = false }
+libc = { version = "0.2", optional = true }
+
+[features]
+fuse = ["dep:fuser", "dep:libc"]

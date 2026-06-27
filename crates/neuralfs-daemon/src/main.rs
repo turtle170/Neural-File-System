@@ -4,6 +4,8 @@ mod indexer;
 mod install;
 mod ipc;
 mod logging;
+#[cfg(all(target_os = "linux", feature = "fuse"))]
+mod mountfs;
 mod protocol;
 mod scorer;
 mod search;
@@ -31,6 +33,52 @@ fn data_dir() -> PathBuf {
         .join("neuralfs")
 }
 
+/// Extract the value following `--flag` in the argument list.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1).cloned())
+}
+
+/// Run the FUSE user-mode filesystem hook (Linux/WSL, `--features fuse`).
+fn run_mount_mode(args: &[String], mountpoint: &str) {
+    #[cfg(all(target_os = "linux", feature = "fuse"))]
+    {
+        let backing = flag_value(args, "--backing").unwrap_or_else(|| {
+            data_dir().join("backing").to_string_lossy().to_string()
+        });
+        let cache_bytes = flag_value(args, "--cache-mb")
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|mb| mb * 1024 * 1024)
+            .unwrap_or(neuralfs_fs::DEFAULT_CACHE_BYTES);
+
+        // Minimal stderr logging for the foreground mount process.
+        let _ = logging::init(
+            &data_dir().join("neuralfs-mount.log"),
+            log::LevelFilter::Info,
+        );
+        eprintln!(
+            "NeuralFS hook: mounting at {mountpoint} (backing {backing}, cache {} MiB)",
+            cache_bytes / (1024 * 1024)
+        );
+        if let Err(e) = mountfs::run_mount(
+            std::path::Path::new(mountpoint),
+            std::path::Path::new(&backing),
+            cache_bytes,
+        ) {
+            eprintln!("mount failed: {e:#}");
+            std::process::exit(1);
+        }
+    }
+    #[cfg(not(all(target_os = "linux", feature = "fuse")))]
+    {
+        let _ = (args, mountpoint);
+        eprintln!(
+            "--mount requires a Linux build with the `fuse` feature: \
+             cargo build --release --features fuse"
+        );
+        std::process::exit(1);
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -47,6 +95,12 @@ async fn main() {
             eprintln!("uninstall failed: {e}");
             std::process::exit(1);
         }
+        return;
+    }
+
+    // User-mode filesystem hook: `neuralfs --mount <mountpoint> [--backing <dir>]`.
+    if let Some(mountpoint) = flag_value(&args, "--mount") {
+        run_mount_mode(&args, &mountpoint);
         return;
     }
 

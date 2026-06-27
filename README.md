@@ -1,6 +1,6 @@
 # NeuralFS
 
-NeuralFS is two things in one daemon:
+NeuralFS is three things in one daemon:
 
 1. **A learned file finder** — it indexes your real files, learns which
    directories a query resolves to (TF-IDF + softmax/logistic regression),
@@ -8,7 +8,12 @@ NeuralFS is two things in one daemon:
    learning online from every access while it runs**.
 2. **A real filesystem engine** — a lightweight copy-on-write,
    content-addressed, checksummed object store (`neuralfs-fs`): ZFS-like
-   integrity, O(1) snapshots, and transparent block dedup, but far lighter.
+   integrity, O(1) snapshots, transparent block dedup, and a strict 1 GiB
+   frequency-aware RAM cache — but far lighter than ZFS.
+3. **A user-mode filesystem hook** — a FUSE passthrough mount that sits in
+   front of a real directory, serves metadata at native speed, and pulls
+   frequently-read ("hot") files into the 1 GiB RAM cache so repeat reads come
+   from memory (Linux/WSL; WinFsp is the documented Windows equivalent).
 
 A small CLI (`nfs`) drives it all over a Windows named pipe.
 
@@ -31,12 +36,15 @@ neuralfs/
 │   │       ├── scorer.rs       # frequency + exponential decay scoring
 │   │       ├── search.rs       # predict -> backtrack -> fallback lookup
 │   │       ├── watcher.rs      # notify-based FS event watcher
-│   │       ├── ipc.rs          # named-pipe server: find/open/fs/hook/ai/bench
+│   │       ├── ipc.rs          # named-pipe server: find/open/fs/hook/ai/cache/bench
+│   │       ├── mountfs.rs      # FUSE passthrough caching mount (Linux/WSL, feature=fuse)
 │   │       ├── store.rs        # sled-backed index persistence
 │   │       └── ...             # config, logging, install, state, protocol
 │   └── neuralfs-cli/           # CLI binary -> nfs.exe
 └── README.md
 ```
+
+(`neuralfs-fs` also contains `cache.rs` — the strict, frequency-aware RAM cache.)
 
 ## Building
 
@@ -59,28 +67,72 @@ A genuine copy-on-write object filesystem, usable through `nfs fs ...`:
 - **Transparent dedup** — identical blocks (across files *and* within a file)
   are stored once; `nfs fs info` reports the live dedup ratio.
 - **Scrub** — `nfs fs scrub` walks and re-verifies every block's checksum.
-- **Speed** — append-only block log + LRU block cache. Measured on this machine
-  (`nfs bench 256`): **~1.8 GB/s write, ~2.0 GB/s read *including* blake3
-  verification.**
+- **Speed** — append-only block log + the RAM cache below. Honest `nfs bench 64`
+  on this machine: **~258 MB/s write to disk** (CoW + blake3 + sled metadata,
+  competitive with raw ext4's ~226 MB/s while doing strictly more work), and
+  cache-warm reads at **~1.8 GB/s**.
+
+## The 1 GiB frequency-aware RAM cache (ZFS-ARC style)
+
+`neuralfs-fs/cache.rs` is a strict, byte-bounded, frequency-aware cache:
+
+- **Strict cap** — a hard byte ceiling (default **1 GiB**), enforced after every
+  insert; resident bytes never exceed it (unit-tested).
+- **Frequency promotion (SLRU)** — new data lands in a *probation* segment; data
+  read **again** is promoted to a *protected* segment, so genuinely hot data
+  survives eviction pressure that churns through one-shot reads. This is exactly
+  "if a file's read frequency is high enough, keep it in RAM."
+- **Used everywhere** — backs the CoW volume's block cache and the FUSE hot-file
+  cache. `nfs cache` shows resident bytes, hit rate, promotions, and evictions.
+
+The filesystem also keeps a separate **immutable-inode cache**: because CoW gives
+every modified inode a brand-new id, cached inodes can never go stale, so hot
+metadata is served from RAM with no sled lookups.
 
 ## Hooking onto your real filesystem
+
+Two hooks, depending on what you want:
+
+### 1. Learned search/access layer (cross-platform)
 
 ```sh
 nfs hook "C:/Users/me/Documents"   # index it, watch it live, learn from it
 nfs hook                           # show currently hooked directories
 ```
 
-`hook` attaches NeuralFS to a real directory at runtime: it indexes the tree,
-starts a live `notify` watcher on it, and turns on access-driven learning. This
-is a **userspace hook** — NeuralFS becomes the smart access/search layer over
-your real files.
+This indexes the tree, starts a live `notify` watcher, and turns on
+access-driven learning — NeuralFS becomes the smart search layer over your files.
 
-> **Kernel mount (future).** Exposing NeuralFS as an actual mounted drive
-> letter (so the OS routes *all* file I/O through it) requires a kernel
-> filesystem driver. The supported path is [WinFsp](https://winfsp.dev/) (the
-> Windows FUSE equivalent): a `mount` mode would back a WinFsp volume with the
-> `neuralfs-fs` engine. It needs the WinFsp driver installed and signed, so it
-> is documented here as the extension point rather than shipped untested.
+### 2. User-mode filesystem mount (FUSE — Linux/WSL)
+
+```sh
+cargo build --release --features fuse
+neuralfs --mount /mnt/nfs --backing /data/store --cache-mb 1024
+```
+
+This is a **real user-mode filesystem**: the OS routes file I/O for everything
+under `/mnt/nfs` through the NeuralFS daemon. Metadata operations pass through to
+the backing directory at native speed; file reads go through the 1 GiB
+frequency-aware cache, so a file opened often enough is served from RAM.
+
+**Measured in a clean WSL2 VM** (passthrough over ext4):
+
+| workload | raw ext4 | NeuralFS FUSE hook | vs. old `nfs fs` CLI path |
+|---|---|---|---|
+| small-file read (500 × 2 KiB) | 820 files/s | **408 files/s** | was 185 files/s — **2.2× faster** |
+| hot 200 MiB file, repeat read | — | **1465 MB/s from RAM** (vs 538 MB/s cold) | — |
+
+The honest takeaway: FUSE pays an inherent userspace round-trip tax, so raw ext4
+still wins metadata-heavy small-file workloads (~2×). But the mount more than
+doubled small-file throughput over the previous CLI/IPC approach, and the cache
+makes repeated reads of hot data RAM-fast — both of the user's "make it faster"
+goals, within the limits of a user-mode (non-kernel) hook.
+
+> **Windows-native mount.** The same engine + cache works under
+> [WinFsp](https://winfsp.dev/) (the Windows FUSE equivalent): a WinFsp host
+> would replace `mountfs.rs`'s `fuser` bridge while reusing `neuralfs-fs` and the
+> cache unchanged. WinFsp ships a signed kernel driver that must be installed, so
+> it's documented as the drop-in Windows path rather than bundled here.
 
 ## The continuously-learning AI
 
@@ -106,6 +158,7 @@ nfs status                   # daemon status, index size, last retrain
 nfs reindex                  # full re-index of hooked dirs
 nfs hook <dir> | nfs hook    # attach a real dir / list hooked dirs
 nfs ai                       # continuously-updated model status
+nfs cache                    # RAM cache stats (1 GiB cap, hit rate, promotions)
 nfs config get|set <k> [v]   # lambda, root_dirs, retrain_threshold, ...
 
 # the copy-on-write virtual filesystem
@@ -127,9 +180,15 @@ nfs bench [MiB]              # virtual-fs write/read throughput (default 64)
 ## Daemon lifecycle (Windows)
 
 ```sh
-neuralfs.exe                 # run in foreground
+neuralfs.exe                 # run in foreground (index + search + AI + CoW volume)
 neuralfs.exe --install       # register a logon startup task (Task Scheduler)
 neuralfs.exe --uninstall
+```
+
+On Linux/WSL, the same binary built `--features fuse` also offers the mount hook:
+
+```sh
+neuralfs --mount <mountpoint> --backing <dir> [--cache-mb 1024]
 ```
 
 State lives under `%APPDATA%/neuralfs/`:
@@ -155,4 +214,12 @@ neuralfs.log
 - **IPC transport** is Windows named pipes (`\\.\pipe\neuralfs`) with a Unix
   socket fallback compiled under `cfg(unix)`. Binary `fs read/write` over IPC is
   capped at 16 MiB; the in-process `bench` bypasses IPC.
+- **FUSE hook is Linux/WSL only**, behind the off-by-default `fuse` feature
+  (optional `fuser`/`libc` deps), so the default Windows build is untouched. It
+  is a *passthrough caching* layer over a real directory, not the CoW volume;
+  the CoW volume is reached via `nfs fs`. Windows uses WinFsp (see above).
+- **Benchmark honesty.** An earlier `nfs bench` fill repeated every 32 blocks, so
+  dedup silently collapsed it and inflated throughput. The fill is now a
+  long-period xorshift64 stream (genuinely unique blocks), and the numbers above
+  reflect that correction. The FUSE figures come from a clean, disposable WSL2 VM.
 ```

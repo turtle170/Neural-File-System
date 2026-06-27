@@ -27,6 +27,8 @@ pub enum Request {
     HookStatus,
     // Continuously-updated AI model status.
     Ai,
+    // RAM cache (ARC) statistics.
+    Cache,
     // In-daemon throughput benchmark.
     Bench { mb: usize },
 }

@@ -1,12 +1,12 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use lru::LruCache;
 use parking_lot::Mutex;
+
+use crate::cache::{CacheStats, RamCache};
 
 /// Logical block size. Files are split into chunks of at most this many bytes.
 pub const BLOCK_SIZE: usize = 64 * 1024;
@@ -41,11 +41,12 @@ struct DataLog {
 pub struct BlockStore {
     log: Mutex<DataLog>,
     index: sled::Tree,
-    cache: Mutex<LruCache<Hash, Arc<Vec<u8>>>>,
+    cache: Mutex<RamCache<Hash>>,
 }
 
 impl BlockStore {
-    pub fn open(data_path: &Path, index: sled::Tree, cache_blocks: usize) -> Result<Self> {
+    /// `cache_bytes` is the strict RAM budget for cached block data.
+    pub fn open(data_path: &Path, index: sled::Tree, cache_bytes: u64) -> Result<Self> {
         let file = OpenOptions::new()
             .create(true)
             .read(true)
@@ -53,11 +54,10 @@ impl BlockStore {
             .open(data_path)
             .with_context(|| format!("opening data log {}", data_path.display()))?;
         let len = file.metadata()?.len();
-        let cap = NonZeroUsize::new(cache_blocks.max(1)).unwrap();
         Ok(Self {
             log: Mutex::new(DataLog { file, len }),
             index,
-            cache: Mutex::new(LruCache::new(cap)),
+            cache: Mutex::new(RamCache::new(cache_bytes)),
         })
     }
 
@@ -81,14 +81,15 @@ impl BlockStore {
 
         self.index
             .insert(hash, enc(data_offset, bytes.len() as u32).to_vec())?;
-        self.cache.lock().put(hash, Arc::new(bytes.to_vec()));
+        self.cache.lock().insert(hash, Arc::new(bytes.to_vec()));
         Ok(hash)
     }
 
-    /// Fetch a block by content address, verifying its integrity.
+    /// Fetch a block by content address, verifying its integrity. Served from
+    /// the RAM cache on a hit (no disk I/O, no re-hash).
     pub fn get(&self, hash: &Hash) -> Result<Arc<Vec<u8>>> {
         if let Some(v) = self.cache.lock().get(hash) {
-            return Ok(v.clone());
+            return Ok(v);
         }
         let (offset, len) = match self.index.get(hash)? {
             Some(v) => dec(&v),
@@ -109,8 +110,12 @@ impl BlockStore {
             );
         }
         let arc = Arc::new(buf);
-        self.cache.lock().put(*hash, arc.clone());
+        self.cache.lock().insert(*hash, arc.clone());
         Ok(arc)
+    }
+
+    pub fn cache_stats(&self) -> CacheStats {
+        self.cache.lock().stats()
     }
 
     /// Number of unique stored blocks.

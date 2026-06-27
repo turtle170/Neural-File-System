@@ -30,6 +30,7 @@ pub enum Request {
     Hook { dir: String },
     HookStatus,
     Ai,
+    Cache,
     Bench { mb: usize },
 }
 
