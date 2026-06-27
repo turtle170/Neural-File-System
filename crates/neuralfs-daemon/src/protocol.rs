@@ -10,6 +10,25 @@ pub enum Request {
     Reindex,
     ConfigGet { key: String },
     ConfigSet { key: String, value: String },
+    // Virtual filesystem operations (operate on the NeuralFS CoW volume).
+    FsWrite { path: String, data_b64: String },
+    FsRead { path: String },
+    FsLs { path: String },
+    FsMkdir { path: String },
+    FsRm { path: String },
+    FsStat { path: String },
+    FsInfo,
+    FsSnapshot { name: String },
+    FsSnapshots,
+    FsRollback { name: String },
+    FsScrub,
+    // Hook the daemon onto a real directory of the user's filesystem.
+    Hook { dir: String },
+    HookStatus,
+    // Continuously-updated AI model status.
+    Ai,
+    // In-daemon throughput benchmark.
+    Bench { mb: usize },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -35,6 +54,12 @@ pub struct Response {
     pub message: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub opened_path: Option<String>,
+    /// Human-readable multi-row output (ls, info, ai, snapshots, bench, ...).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lines: Option<Vec<String>>,
+    /// Base64-encoded binary payload (fs read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_b64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

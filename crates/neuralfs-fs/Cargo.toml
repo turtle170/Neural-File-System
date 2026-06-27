@@ -1,0 +1,13 @@
+[package]
+name = "neuralfs-fs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+blake3 = "1"
+sled = "0.34"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+lru = "0.12"
+parking_lot = "0.12"
+anyhow = "1"

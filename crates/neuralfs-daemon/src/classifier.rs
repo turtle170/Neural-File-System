@@ -22,11 +22,68 @@ pub struct Classifier {
     classes: Vec<String>,
     weights: Array2<f64>,
     bias: Array1<f64>,
+    /// Number of online SGD updates applied since the last full (re)train.
+    #[serde(default)]
+    updates: u64,
+    /// Monotonic version, bumped on every full train and every online update.
+    /// Lets the checkpoint loop detect an evolving model cheaply.
+    #[serde(default)]
+    version: u64,
 }
 
 impl Classifier {
     pub fn is_trained(&self) -> bool {
         !self.classes.is_empty()
+    }
+
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+
+    pub fn online_updates(&self) -> u64 {
+        self.updates
+    }
+
+    pub fn num_classes(&self) -> usize {
+        self.classes.len()
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.vocab.len()
+    }
+
+    /// Apply a single online (incremental) SGD step: nudge the model toward
+    /// predicting `parent_dir` for `query`. This is what lets the AI keep
+    /// learning continuously from real accesses while the daemon is alive,
+    /// without a full retrain. Returns true if an update was applied.
+    pub fn online_update(&mut self, query: &str, parent_dir: &str, lr: f64) -> bool {
+        if !self.is_trained() {
+            return false;
+        }
+        let Some(class_idx) = self.classes.iter().position(|c| c == parent_dir) else {
+            return false;
+        };
+        let Some(x) = self.vectorize(query) else {
+            return false;
+        };
+
+        let logits = x.dot(&self.weights) + &self.bias;
+        let probs = softmax_1d(&logits);
+
+        // d = (probs - onehot(class_idx)); gradient = outer(x, d).
+        let mut d = probs;
+        d[class_idx] -= 1.0;
+
+        let grad = x
+            .view()
+            .insert_axis(Axis(1))
+            .dot(&d.view().insert_axis(Axis(0)));
+        self.weights = &self.weights - lr * grad;
+        self.bias = &self.bias - lr * &d;
+
+        self.updates += 1;
+        self.version += 1;
+        true
     }
 
     /// Tokenize a path or query string into lowercase word pieces.
@@ -134,6 +191,8 @@ impl Classifier {
             classes,
             weights,
             bias,
+            updates: 0,
+            version: 1,
         })
     }
 

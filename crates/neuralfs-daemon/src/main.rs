@@ -12,10 +12,12 @@ mod store;
 mod watcher;
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use neuralfs_fs::Filesystem;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use classifier::Classifier;
@@ -66,7 +68,14 @@ async fn run() -> Result<()> {
     log::info!("neuralfs daemon starting, data dir = {}", dir.display());
 
     let store = Arc::new(Store::open(&dir.join("index.db"))?);
-    let state = Arc::new(DaemonState::new(store.clone(), config.clone(), config_path));
+    let vfs = Arc::new(Filesystem::open(&dir.join("volume"))?);
+    log::info!("opened virtual filesystem volume at {}", dir.join("volume").display());
+    let state = Arc::new(DaemonState::new(
+        store.clone(),
+        vfs,
+        config.clone(),
+        config_path,
+    ));
 
     // Initial full re-index on startup.
     {
@@ -112,21 +121,24 @@ async fn run() -> Result<()> {
                 trained
             }
         };
+        state.saved_version.store(clf.version(), Ordering::SeqCst);
         *state.classifier.write().await = clf;
         *state.last_retrain.write().await = Some(chrono::Local::now().to_rfc2822());
     }
 
     let (retrain_tx, retrain_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
-    let _watcher_guard = watcher::spawn_watcher(
+    let watcher = watcher::spawn_watcher(
         store.clone(),
         config.root_dirs.clone(),
         config.retrain_threshold,
         retrain_tx.clone(),
     )?;
+    *state.watcher.lock() = Some(watcher);
 
     tokio::spawn(retrain_loop(state.clone(), retrain_rx));
-    tokio::spawn(periodic_flush(store.clone()));
+    tokio::spawn(periodic_flush(store.clone(), state.vfs.clone()));
+    tokio::spawn(ai_checkpoint_loop(state.clone()));
 
     ipc::run_server(state.clone(), retrain_tx).await?;
     Ok(())
@@ -148,6 +160,7 @@ async fn retrain_loop(state: Arc<DaemonState>, mut rx: UnboundedReceiver<()>) {
                         log::error!("failed to persist classifier model: {e}");
                     }
                 }
+                state.saved_version.store(clf.version(), Ordering::SeqCst);
                 *state.classifier.write().await = clf;
                 *state.last_retrain.write().await = Some(chrono::Local::now().to_rfc2822());
                 log::info!("classifier retrained");
@@ -158,11 +171,42 @@ async fn retrain_loop(state: Arc<DaemonState>, mut rx: UnboundedReceiver<()>) {
     }
 }
 
-async fn periodic_flush(store: Arc<Store>) {
+async fn periodic_flush(store: Arc<Store>, vfs: Arc<Filesystem>) {
     loop {
         tokio::time::sleep(Duration::from_secs(60)).await;
         if let Err(e) = store.flush() {
             log::error!("periodic flush failed: {e}");
+        }
+        if let Err(e) = vfs.flush() {
+            log::error!("vfs flush failed: {e}");
+        }
+    }
+}
+
+/// Persists the classifier whenever online learning has advanced its version
+/// past what's on disk — so the AI is "stored and updated as long as it is
+/// active," not just on full retrains.
+async fn ai_checkpoint_loop(state: Arc<DaemonState>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        let current = state.classifier.read().await.version();
+        if current == state.saved_version.load(Ordering::SeqCst) {
+            continue;
+        }
+        let bytes = {
+            let clf = state.classifier.read().await;
+            bincode::serialize(&*clf)
+        };
+        match bytes {
+            Ok(bytes) => {
+                if let Err(e) = state.store.save_model(&bytes) {
+                    log::error!("ai checkpoint failed: {e}");
+                } else {
+                    state.saved_version.store(current, Ordering::SeqCst);
+                    log::info!("ai checkpoint saved (version {current})");
+                }
+            }
+            Err(e) => log::error!("ai checkpoint serialize failed: {e}"),
         }
     }
 }

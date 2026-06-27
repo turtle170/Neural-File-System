@@ -16,6 +16,21 @@ pub enum Request {
     Reindex,
     ConfigGet { key: String },
     ConfigSet { key: String, value: String },
+    FsWrite { path: String, data_b64: String },
+    FsRead { path: String },
+    FsLs { path: String },
+    FsMkdir { path: String },
+    FsRm { path: String },
+    FsStat { path: String },
+    FsInfo,
+    FsSnapshot { name: String },
+    FsSnapshots,
+    FsRollback { name: String },
+    FsScrub,
+    Hook { dir: String },
+    HookStatus,
+    Ai,
+    Bench { mb: usize },
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -34,6 +49,8 @@ pub struct Response {
     pub ok: Option<bool>,
     pub message: Option<String>,
     pub opened_path: Option<String>,
+    pub lines: Option<Vec<String>>,
+    pub data_b64: Option<String>,
     pub error: Option<String>,
 }
 

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/neuralfs-fs",
     "crates/neuralfs-daemon",
     "crates/neuralfs-cli",
 ]
