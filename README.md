@@ -89,6 +89,23 @@ The filesystem also keeps a separate **immutable-inode cache**: because CoW give
 every modified inode a brand-new id, cached inodes can never go stale, so hot
 metadata is served from RAM with no sled lookups.
 
+## The 500 MiB, 5-minute path cache (sliding TTL)
+
+A second, independent cache (`neuralfs-daemon/pathcache.rs`) accelerates *search*:
+when `nfs find` returns results — the paths the AI guessed or that were otherwise
+found — they're cached keyed by the query.
+
+- **Separate 500 MiB budget**, distinct from the 1 GiB block cache, strictly
+  enforced (soonest-to-expire entries evicted first if it would overflow).
+- **5-minute sliding TTL** — each entry expires 5 minutes after its *last* use.
+  Re-running the same query within the window serves it from RAM **and refreshes
+  the timer**, so hot queries stay resident while one-off queries age out.
+- A background sweeper drops expired entries every 30 s; `nfs cache` shows both
+  caches (resident bytes, hits/misses, expirations, evictions).
+
+This is unit-tested for sliding-refresh, expiry, sweep reclamation, and strict
+cap enforcement.
+
 ## Hooking onto your real filesystem
 
 Two hooks, depending on what you want:
@@ -128,11 +145,27 @@ doubled small-file throughput over the previous CLI/IPC approach, and the cache
 makes repeated reads of hot data RAM-fast — both of the user's "make it faster"
 goals, within the limits of a user-mode (non-kernel) hook.
 
-> **Windows-native mount.** The same engine + cache works under
-> [WinFsp](https://winfsp.dev/) (the Windows FUSE equivalent): a WinFsp host
-> would replace `mountfs.rs`'s `fuser` bridge while reusing `neuralfs-fs` and the
-> cache unchanged. WinFsp ships a signed kernel driver that must be installed, so
-> it's documented as the drop-in Windows path rather than bundled here.
+> **Windows-native drive-letter mount (WinFsp).** WinFsp *is* the kernel driver
+> — it ships a pre-signed kernel-mode filesystem driver, and you write a
+> *user-mode host* against it (the `winfsp` Rust crate). The same `neuralfs-fs`
+> engine + caches would back that host, exposing a real drive letter `N:`.
+>
+> Installing WinFsp's driver requires an elevated (admin) token. In this
+> headless environment the daemon runs under a UAC-filtered standard token, so a
+> silent `msiexec /i winfsp.msi /qn` fails with **1603** and the host crate
+> (which links `winfsp-sys`) can't even compile without the driver present. To
+> enable it on a real machine:
+>
+> ```powershell
+> # 1. In an ELEVATED PowerShell (Run as administrator):
+> msiexec /i winfsp-2.0.23075.msi /qn
+> # 2. Then build with the (planned) winfsp host feature and mount:
+> #    neuralfs --mount-winfsp N: --backing C:\data
+> ```
+>
+> The host is not bundled yet because it cannot be compiled or tested without the
+> driver installed; the FUSE mount (`mountfs.rs`) is the proven, equivalent
+> implementation of the same idea on Linux/WSL.
 
 ## The continuously-learning AI
 
@@ -158,7 +191,7 @@ nfs status                   # daemon status, index size, last retrain
 nfs reindex                  # full re-index of hooked dirs
 nfs hook <dir> | nfs hook    # attach a real dir / list hooked dirs
 nfs ai                       # continuously-updated model status
-nfs cache                    # RAM cache stats (1 GiB cap, hit rate, promotions)
+nfs cache                    # both caches: 1 GiB block cache + 500 MiB path TTL cache
 nfs config get|set <k> [v]   # lambda, root_dirs, retrain_threshold, ...
 
 # the copy-on-write virtual filesystem

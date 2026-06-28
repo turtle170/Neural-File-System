@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 
 use crate::classifier::Classifier;
 use crate::config::Config;
+use crate::pathcache::{PathTtlCache, DEFAULT_CAP_BYTES, DEFAULT_TTL};
 use crate::store::Store;
 
 pub struct DaemonState {
@@ -23,6 +24,8 @@ pub struct DaemonState {
     pub watcher: Mutex<Option<RecommendedWatcher>>,
     /// Model version most recently persisted to disk by the checkpoint loop.
     pub saved_version: AtomicU64,
+    /// 500 MiB, 5-minute sliding-TTL cache of found/AI-guessed query results.
+    pub path_cache: PathTtlCache,
 }
 
 impl DaemonState {
@@ -41,6 +44,7 @@ impl DaemonState {
             last_retrain: RwLock::new(None),
             watcher: Mutex::new(None),
             saved_version: AtomicU64::new(0),
+            path_cache: PathTtlCache::new(DEFAULT_TTL, DEFAULT_CAP_BYTES),
         }
     }
 }

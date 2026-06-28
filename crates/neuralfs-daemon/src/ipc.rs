@@ -114,9 +114,22 @@ async fn handle_request(
 ) -> Response {
     match req {
         Request::Find { query } => {
-            let cfg = state.config.read().await;
-            let clf = state.classifier.read().await;
-            let results = search::find(state.store.as_ref(), &clf, &query, cfg.lambda, cfg.max_results);
+            // Hot path: a result found within the last 5 minutes is served
+            // straight from the TTL cache, and the access refreshes its timer.
+            let now = Instant::now();
+            if let Some(cached) = state.path_cache.get(&query, now) {
+                return Response {
+                    results: Some(cached),
+                    ..Default::default()
+                };
+            }
+            let results = {
+                let cfg = state.config.read().await;
+                let clf = state.classifier.read().await;
+                search::find(state.store.as_ref(), &clf, &query, cfg.lambda, cfg.max_results)
+            };
+            // Cache the paths that were found / the AI guessed.
+            state.path_cache.insert(query.clone(), results.clone(), now);
             Response {
                 results: Some(results),
                 ..Default::default()
@@ -339,18 +352,30 @@ async fn handle_request(
             ])
         }
 
-        // ---- RAM cache (ARC) stats --------------------------------------
+        // ---- RAM cache stats --------------------------------------------
         Request::Cache => {
             let s = state.vfs.cache_stats();
+            let p = state.path_cache.stats();
             let mib = |b: u64| format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0));
+            let mib_us = |b: usize| format!("{:.1} MiB", b as f64 / (1024.0 * 1024.0));
             lines(vec![
-                format!("cap:             {}", mib(s.cap_bytes)),
-                format!("resident:        {}", mib(s.resident_bytes)),
-                format!("entries:         {} (protected {}, probation {})", s.entries, s.protected_entries, s.probation_entries),
-                format!("hits / misses:   {} / {}", s.hits, s.misses),
-                format!("hit rate:        {:.1}%", s.hit_rate() * 100.0),
-                format!("promotions:      {}", s.promotions),
-                format!("evictions:       {}", s.evictions),
+                "[block cache: frequency-aware ARC, file data]".to_string(),
+                format!("  cap:             {}", mib(s.cap_bytes)),
+                format!("  resident:        {}", mib(s.resident_bytes)),
+                format!("  entries:         {} (protected {}, probation {})", s.entries, s.protected_entries, s.probation_entries),
+                format!("  hits / misses:   {} / {}", s.hits, s.misses),
+                format!("  hit rate:        {:.1}%", s.hit_rate() * 100.0),
+                format!("  promotions:      {}", s.promotions),
+                format!("  evictions:       {}", s.evictions),
+                String::new(),
+                "[path TTL cache: found/AI-guessed query results]".to_string(),
+                format!("  ttl:             {}s (sliding)", p.ttl_secs),
+                format!("  cap:             {}", mib_us(p.cap_bytes)),
+                format!("  resident:        {}", mib_us(p.resident_bytes)),
+                format!("  entries:         {}", p.entries),
+                format!("  hits / misses:   {} / {}", p.hits, p.misses),
+                format!("  expired:         {}", p.expired),
+                format!("  evictions:       {}", p.evictions),
             ])
         }
 

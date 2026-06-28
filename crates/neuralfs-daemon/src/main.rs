@@ -6,6 +6,7 @@ mod ipc;
 mod logging;
 #[cfg(all(target_os = "linux", feature = "fuse"))]
 mod mountfs;
+mod pathcache;
 mod protocol;
 mod scorer;
 mod search;
@@ -193,6 +194,7 @@ async fn run() -> Result<()> {
     tokio::spawn(retrain_loop(state.clone(), retrain_rx));
     tokio::spawn(periodic_flush(store.clone(), state.vfs.clone()));
     tokio::spawn(ai_checkpoint_loop(state.clone()));
+    tokio::spawn(path_cache_sweeper(state.clone()));
 
     ipc::run_server(state.clone(), retrain_tx).await?;
     Ok(())
@@ -222,6 +224,15 @@ async fn retrain_loop(state: Arc<DaemonState>, mut rx: UnboundedReceiver<()>) {
             Ok(Err(e)) => log::error!("classifier retrain failed: {e}"),
             Err(e) => log::error!("classifier retrain task panicked: {e}"),
         }
+    }
+}
+
+/// Periodically drops expired entries from the 5-minute path cache so memory is
+/// reclaimed even for queries that are never repeated.
+async fn path_cache_sweeper(state: Arc<DaemonState>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        state.path_cache.sweep(std::time::Instant::now());
     }
 }
 
