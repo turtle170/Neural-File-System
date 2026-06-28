@@ -10,10 +10,10 @@ NeuralFS is three things in one daemon:
    content-addressed, checksummed object store (`neuralfs-fs`): ZFS-like
    integrity, O(1) snapshots, transparent block dedup, and a strict 1 GiB
    frequency-aware RAM cache — but far lighter than ZFS.
-3. **A user-mode filesystem hook** — a FUSE passthrough mount that sits in
-   front of a real directory, serves metadata at native speed, and pulls
-   frequently-read ("hot") files into the 1 GiB RAM cache so repeat reads come
-   from memory (Linux/WSL; WinFsp is the documented Windows equivalent).
+3. **Real filesystem mounts** — a FUSE passthrough caching mount on Linux/WSL
+   (serves metadata at native speed, pulls hot files into the 1 GiB RAM cache),
+   and a **WinFsp drive-letter mount on Windows** that exposes NeuralFS as a real
+   drive `N:` through the WinFsp kernel-mode driver (verified working).
 
 A small CLI (`nfs`) drives it all over a Windows named pipe.
 
@@ -37,7 +37,9 @@ neuralfs/
 │   │       ├── search.rs       # predict -> backtrack -> fallback lookup
 │   │       ├── watcher.rs      # notify-based FS event watcher
 │   │       ├── ipc.rs          # named-pipe server: find/open/fs/hook/ai/cache/bench
+│   │       ├── pathcache.rs    # 500 MiB, 5-min sliding-TTL cache of found paths
 │   │       ├── mountfs.rs      # FUSE passthrough caching mount (Linux/WSL, feature=fuse)
+│   │       ├── winfsphost.rs   # WinFsp drive-letter mount (Windows, feature=winfsp)
 │   │       ├── store.rs        # sled-backed index persistence
 │   │       └── ...             # config, logging, install, state, protocol
 │   └── neuralfs-cli/           # CLI binary -> nfs.exe
@@ -145,27 +147,37 @@ doubled small-file throughput over the previous CLI/IPC approach, and the cache
 makes repeated reads of hot data RAM-fast — both of the user's "make it faster"
 goals, within the limits of a user-mode (non-kernel) hook.
 
-> **Windows-native drive-letter mount (WinFsp).** WinFsp *is* the kernel driver
-> — it ships a pre-signed kernel-mode filesystem driver, and you write a
-> *user-mode host* against it (the `winfsp` Rust crate). The same `neuralfs-fs`
-> engine + caches would back that host, exposing a real drive letter `N:`.
->
-> Installing WinFsp's driver requires an elevated (admin) token. In this
-> headless environment the daemon runs under a UAC-filtered standard token, so a
-> silent `msiexec /i winfsp.msi /qn` fails with **1603** and the host crate
-> (which links `winfsp-sys`) can't even compile without the driver present. To
-> enable it on a real machine:
->
-> ```powershell
-> # 1. In an ELEVATED PowerShell (Run as administrator):
-> msiexec /i winfsp-2.0.23075.msi /qn
-> # 2. Then build with the (planned) winfsp host feature and mount:
-> #    neuralfs --mount-winfsp N: --backing C:\data
-> ```
->
-> The host is not bundled yet because it cannot be compiled or tested without the
-> driver installed; the FUSE mount (`mountfs.rs`) is the proven, equivalent
-> implementation of the same idea on Linux/WSL.
+### 3. Windows-native drive-letter mount (WinFsp — working)
+
+WinFsp *is* the kernel driver — it ships a pre-signed kernel-mode filesystem
+driver, and NeuralFS provides the *user-mode host* against it
+([`winfsphost.rs`](crates/neuralfs-daemon/src/winfsphost.rs), the `winfsp`
+feature). This mounts NeuralFS as a **real Windows drive letter**, with the OS
+routing all file I/O through the WinFsp kernel driver into the daemon.
+
+```powershell
+# Build (needs WinFsp + its Developer package, and LLVM/libclang for bindgen):
+$env:LIBCLANG_PATH = "C:\path\to\LLVM\bin"
+cargo build --release -p neuralfs-daemon --features winfsp
+
+# Mount as drive N: (Ctrl-C to unmount):
+.\target\release\neuralfs.exe --mount-winfsp N:
+```
+
+**Verified working** against installed WinFsp 2.1: `N:\` appears as a real drive;
+create / read / write files, `mkdir`, and directory listing all succeed through
+the kernel driver, and the volume unmounts cleanly on stop. The current host is a
+self-contained in-memory filesystem proving the kernel-driver integration
+end-to-end; backing it with the CoW `neuralfs-fs` engine + the 1 GiB cache (so
+the drive letter gets checksums, dedup, snapshots, and hot-file RAM caching) is
+the next step, reusing the exact same engine the FUSE mount already uses.
+
+Notes:
+- `winfsp` is a GPL-3.0 crate, so a `--features winfsp` build is GPL-licensed;
+  the default build pulls none of it.
+- `winfsp-sys` finds the SDK via the registry (the WinFsp **Developer** feature
+  must be installed so `inc\` and `lib\` are present), and uses `bindgen`, which
+  needs `libclang` — point `LIBCLANG_PATH` at an LLVM `bin` directory.
 
 ## The continuously-learning AI
 
@@ -218,10 +230,15 @@ neuralfs.exe --install       # register a logon startup task (Task Scheduler)
 neuralfs.exe --uninstall
 ```
 
-On Linux/WSL, the same binary built `--features fuse` also offers the mount hook:
+Platform-specific mount modes (feature-gated, so the default build is untouched):
 
 ```sh
+# Linux/WSL, built --features fuse: passthrough caching mount
 neuralfs --mount <mountpoint> --backing <dir> [--cache-mb 1024]
+
+# Windows, built --features winfsp: real drive-letter mount via the WinFsp driver
+neuralfs --mount-winfsp N:
+neuralfs --winfsp-probe          # confirm the WinFsp driver/library is reachable
 ```
 
 State lives under `%APPDATA%/neuralfs/`:

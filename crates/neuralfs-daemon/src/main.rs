@@ -6,6 +6,8 @@ mod ipc;
 mod logging;
 #[cfg(all(target_os = "linux", feature = "fuse"))]
 mod mountfs;
+#[cfg(all(windows, feature = "winfsp"))]
+mod winfsphost;
 mod pathcache;
 mod protocol;
 mod scorer;
@@ -103,6 +105,42 @@ async fn main() {
     if let Some(mountpoint) = flag_value(&args, "--mount") {
         run_mount_mode(&args, &mountpoint);
         return;
+    }
+
+    // WinFsp build/link probe.
+    if args.iter().any(|a| a == "--winfsp-probe") {
+        #[cfg(all(windows, feature = "winfsp"))]
+        {
+            if let Err(e) = winfsphost::probe() {
+                eprintln!("{e:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(all(windows, feature = "winfsp")))]
+        {
+            eprintln!("--winfsp-probe requires a Windows build with --features winfsp");
+            std::process::exit(1);
+        }
+    }
+
+    // WinFsp drive-letter mount: `neuralfs --mount-winfsp N:`
+    if let Some(drive) = flag_value(&args, "--mount-winfsp") {
+        #[cfg(all(windows, feature = "winfsp"))]
+        {
+            println!("NeuralFS: mounting WinFsp volume at {drive} (Ctrl-C to unmount)");
+            if let Err(e) = winfsphost::run(&drive) {
+                eprintln!("winfsp mount failed: {e:#}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        #[cfg(not(all(windows, feature = "winfsp")))]
+        {
+            let _ = drive;
+            eprintln!("--mount-winfsp requires a Windows build with --features winfsp");
+            std::process::exit(1);
+        }
     }
 
     if let Err(e) = run().await {
