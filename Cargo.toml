@@ -9,6 +9,8 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/turtle170/Neural-File-System"
 
 [profile.release]
 opt-level = 3

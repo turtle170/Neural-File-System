@@ -147,6 +147,27 @@ doubled small-file throughput over the previous CLI/IPC approach, and the cache
 makes repeated reads of hot data RAM-fast — both of the user's "make it faster"
 goals, within the limits of a user-mode (non-kernel) hook.
 
+**Re-measured in two isolated, disposable Linux Docker containers** (privileged,
+`--device /dev/fuse`; A mounts ext4 over a loopback file, B mounts NeuralFS via
+FUSE over a backing dir — a FUSE crash here is userspace, no BSOD risk):
+
+| workload | Container A: raw ext4 | Container B: NeuralFS (FUSE) |
+|---|---|---|
+| sequential write (256 MiB) | **223 MB/s** | 66 MB/s |
+| sequential read | 743 cold / 7159 warm MB/s | 2035 MB/s |
+| small-file create (500 × 2 KiB) | **942 files/s** | 286 files/s |
+| small-file read | **1240 files/s** | 640 files/s |
+| small-file delete | **1163 files/s** | 911 files/s |
+| hot 200 MiB file, repeat read | — | 628 → **1301 MB/s** (cold → RAM-cached) |
+
+Same conclusion as the WSL2 run, reproduced in a cleaner container A/B setup: ext4
+wins raw throughput (native syscalls vs. FUSE's kernel↔userspace round trip per
+op), and NeuralFS's edge is the RAM cache turning repeat reads of hot data ~2×
+faster than even ext4's cold read. Container A/B note: container B's sequential
+*write* (66 MB/s) is the FUSE-mount path specifically — the underlying CoW engine
+itself does ~258 MB/s in-process (`nfs bench`); the gap is FUSE syscall overhead,
+not the storage engine.
+
 ### 3. Windows-native drive-letter mount (WinFsp — working)
 
 WinFsp *is* the kernel driver — it ships a pre-signed kernel-mode filesystem
@@ -173,8 +194,9 @@ the drive letter gets checksums, dedup, snapshots, and hot-file RAM caching) is
 the next step, reusing the exact same engine the FUSE mount already uses.
 
 Notes:
-- `winfsp` is a GPL-3.0 crate, so a `--features winfsp` build is GPL-licensed;
-  the default build pulls none of it.
+- `winfsp` is a GPL-3.0 crate, so a `--features winfsp` build is a GPL-3.0
+  combined work; the default build and `--features fuse` pull none of it and
+  stay Apache-2.0. See [Licensing](#licensing) and [NOTICE](NOTICE).
 - `winfsp-sys` finds the SDK via the registry (the WinFsp **Developer** feature
   must be installed so `inc\` and `lib\` are present), and uses `bindgen`, which
   needs `libclang` — point `LIBCLANG_PATH` at an LLVM `bin` directory.
@@ -272,4 +294,19 @@ neuralfs.log
   dedup silently collapsed it and inflated throughput. The fill is now a
   long-period xorshift64 stream (genuinely unique blocks), and the numbers above
   reflect that correction. The FUSE figures come from a clean, disposable WSL2 VM.
-```
+
+## Licensing
+
+NeuralFS is **Apache-2.0** (see [LICENSE](LICENSE)) — the default build and any
+`--features fuse` build are Apache-2.0 in their entirety; every dependency they
+pull in is permissively licensed (MIT, Apache-2.0, BSD, ISC, CC0-1.0,
+Unicode-3.0, plus one unmodified transitive MPL-2.0 dependency that doesn't
+affect this project's own licensing).
+
+**One carve-out:** the optional `winfsp` feature (the Windows drive-letter
+mount, [`winfsphost.rs`](crates/neuralfs-daemon/src/winfsphost.rs)) links the
+`winfsp`/`winfsp-sys` crates, which are **GPL-3.0** — licensed by their authors,
+not by this project, and not something this project can relicense. A binary
+built with `--features winfsp` is therefore a GPL-3.0 combined work and subject
+to GPL-3.0's terms as a whole. Builds without that feature (the default, and
+`--features fuse`) are unaffected. Full details in [NOTICE](NOTICE).

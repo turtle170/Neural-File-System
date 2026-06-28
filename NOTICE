@@ -1,0 +1,46 @@
+NeuralFS
+Copyright 2026 turtle170
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+---
+
+LICENSING OF THE OPTIONAL `winfsp` FEATURE (IMPORTANT)
+
+The default build of NeuralFS, and any build using `--features fuse`, link
+only permissively-licensed dependencies (MIT, Apache-2.0, BSD, ISC, CC0-1.0,
+Unicode-3.0; one transitive, unmodified MPL-2.0 dependency, `option-ext`,
+which does not affect the licensing of this project's own code). These
+builds are Apache-2.0 in their entirety, as stated in LICENSE.
+
+The optional `winfsp` Cargo feature (crates/neuralfs-daemon/src/winfsphost.rs,
+the Windows drive-letter mount) links the `winfsp` and `winfsp-sys` crates,
+which are licensed under the GNU General Public License v3.0 (GPL-3.0) by
+their authors. NeuralFS does not own and cannot relicense that code.
+
+As a result:
+  - Source code in this repository remains Apache-2.0, as stated in LICENSE,
+    regardless of which features exist in the tree.
+  - Any COMPILED BINARY produced with `--features winfsp` is a combined work
+    that includes GPL-3.0 code, and that binary is therefore subject to the
+    terms of the GPL-3.0 license as a whole — including its copyleft and
+    source-availability obligations — for as long as it includes that code.
+  - Binaries built WITHOUT `--features winfsp` (the default, and
+    `--features fuse`) are unaffected and remain straightforwardly
+    Apache-2.0.
+
+If you redistribute a `--features winfsp` build, you must comply with
+GPL-3.0 (see https://www.gnu.org/licenses/gpl-3.0.html) for that build.
+If this is unacceptable for your use case, build without `--features winfsp`;
+all other functionality (the CoW filesystem engine, the FUSE mount, the
+learned search/AI layer, and the CLI) is unaffected and fully Apache-2.0.
+
+---
+
+This product includes software developed by third parties under their own
+licenses. See Cargo.lock and `cargo license` output for the full dependency
+list and licenses.

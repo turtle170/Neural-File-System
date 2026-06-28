@@ -2,6 +2,12 @@
 name = "neuralfs-daemon"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+# NOTE: this crate's default build and `--features fuse` build are pure
+# Apache-2.0 (see ../../LICENSE). The optional `winfsp` feature links the
+# GPL-3.0-licensed `winfsp`/`winfsp-sys` crates; binaries built with
+# `--features winfsp` are therefore GPL-3.0 combined works. See ../../NOTICE.
 
 [[bin]]
 name = "neuralfs"
