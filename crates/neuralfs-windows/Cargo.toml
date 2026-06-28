@@ -1,0 +1,18 @@
+[package]
+name = "neuralfs-windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NeuralFS Windows (PE) — WinFsp kernel-driver drive-letter mount + Windows tuning. NOTE: links GPL-3.0 winfsp; this binary is a GPL-3.0 combined work."
+
+[[bin]]
+name = "neuralfs-windows"
+path = "src/main.rs"
+
+# Windows-only variant: the winfsp feature needs the WinFsp Developer SDK +
+# libclang to build, and the WinFsp driver to run. See ../../NOTICE for
+# licensing (GPL-3.0). Excluded from the workspace default-members so it is only
+# built on demand (`cargo build -p neuralfs-windows`) on a suitably-set-up host.
+[dependencies]
+neuralfs-daemon = { path = "../neuralfs-daemon", default-features = false, features = ["winfsp"] }

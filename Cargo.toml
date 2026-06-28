@@ -4,6 +4,20 @@ members = [
     "crates/neuralfs-fs",
     "crates/neuralfs-daemon",
     "crates/neuralfs-cli",
+    "crates/neuralfs-cross",
+    "crates/neuralfs-windows",
+    "crates/neuralfs-linux",
+]
+# Plain `cargo build` / `cargo test` builds only what compiles on any host with
+# no special SDK: the core, the daemon lib, the CLI, and the portable Cross
+# binary. The platform-specific variants are built explicitly:
+#   cargo build --release -p neuralfs-windows   # needs WinFsp Developer SDK + libclang (Windows)
+#   cargo build --release -p neuralfs-linux     # needs fuse3 (Linux)
+default-members = [
+    "crates/neuralfs-fs",
+    "crates/neuralfs-daemon",
+    "crates/neuralfs-cli",
+    "crates/neuralfs-cross",
 ]
 
 [workspace.package]

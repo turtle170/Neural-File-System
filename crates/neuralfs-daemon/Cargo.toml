@@ -9,9 +9,8 @@ repository.workspace = true
 # GPL-3.0-licensed `winfsp`/`winfsp-sys` crates; binaries built with
 # `--features winfsp` are therefore GPL-3.0 combined works. See ../../NOTICE.
 
-[[bin]]
-name = "neuralfs"
-path = "src/main.rs"
+[lib]
+path = "src/lib.rs"
 
 [dependencies]
 neuralfs-fs = { path = "../neuralfs-fs" }
@@ -32,7 +31,7 @@ anyhow = "1"
 toml = "0.8"
 
 # FUSE user-mode filesystem hook (Linux/WSL only). Enable with --features fuse.
-fuser = { version = "0.14", optional = true, default-features = false }
+fuser = { version = "0.14", optional = true, default-features = false, features = ["abi-7-23"] }
 libc = { version = "0.2", optional = true }
 
 # WinFsp drive-letter mount (Windows only). Enable with --features winfsp.
@@ -49,5 +48,8 @@ windows = { version = "0.61", optional = true, features = [
 widestring = { version = "1", optional = true }
 
 [features]
+# The brand string is passed in at runtime by each variant binary's main(), so
+# no per-variant feature is needed for identity. These features only gate which
+# native mount compiles in.
 fuse = ["dep:fuser", "dep:libc"]
 winfsp = ["dep:winfsp", "dep:windows", "dep:widestring"]

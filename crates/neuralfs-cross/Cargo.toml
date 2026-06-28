@@ -1,0 +1,19 @@
+[package]
+name = "neuralfs-cross"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NeuralFS Cross — portable build (both ELF and PE). Uses the FUSE mount on Linux for cross-compatibility; no native kernel mount on Windows."
+
+[[bin]]
+name = "neuralfs-cross"
+path = "src/main.rs"
+
+[dependencies]
+# Portable on every platform: the learned search/AI, CoW volume, caches.
+neuralfs-daemon = { path = "../neuralfs-daemon", default-features = false }
+
+# On Linux, Cross additionally offers the (slower, portable) FUSE mount.
+[target.'cfg(target_os = "linux")'.dependencies]
+neuralfs-daemon = { path = "../neuralfs-daemon", default-features = false, features = ["fuse"] }

@@ -110,6 +110,25 @@ fn attr_from_meta(ino: u64, m: &std::fs::Metadata) -> FileAttr {
 }
 
 impl Filesystem for PassthroughFs {
+    fn init(
+        &mut self,
+        _req: &Request,
+        config: &mut fuser::KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        // Ask the kernel to send larger write/read chunks so big sequential I/O
+        // crosses the FUSE boundary in 1 MiB units instead of 128 KiB ones —
+        // fewer userspace round trips per megabyte.
+        let _ = config.set_max_write(1 << 20);
+        let _ = config.set_max_readahead(1 << 20);
+        // Writeback caching: the kernel buffers and coalesces writes in its page
+        // cache and flushes them back in big batches, instead of forwarding every
+        // small write() straight to userspace. This is the single biggest win for
+        // small-file / small-write workloads — it removes most of the per-write
+        // kernel<->userspace round trips that make a plain FUSE passthrough slow.
+        let _ = config.add_capabilities(fuser::consts::FUSE_WRITEBACK_CACHE);
+        Ok(())
+    }
+
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let Some(pp) = self.path_of(parent) else {
             return reply.error(libc::ENOENT);
@@ -246,7 +265,10 @@ impl Filesystem for PassthroughFs {
                         }
                     }
                 }
-                reply.opened(fh, 0);
+                // Keep the kernel page cache across opens: repeated reads of an
+                // unchanged file are served from the kernel's cache without ever
+                // crossing into userspace (on top of our own RAM cache below).
+                reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE);
             }
             Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
         }
@@ -279,7 +301,13 @@ impl Filesystem for PassthroughFs {
                 self.handles.insert(fh, f);
                 self.cache.invalidate(&ino);
                 match std::fs::symlink_metadata(&child) {
-                    Ok(m) => reply.created(&TTL, &attr_from_meta(ino, &m), 0, fh, 0),
+                    Ok(m) => reply.created(
+                        &TTL,
+                        &attr_from_meta(ino, &m),
+                        0,
+                        fh,
+                        fuser::consts::FOPEN_KEEP_CACHE,
+                    ),
                     Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
                 }
             }

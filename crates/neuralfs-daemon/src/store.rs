@@ -40,6 +40,7 @@ pub struct Store {
     db: sled::Db,
     index: sled::Tree,
     by_parent: sled::Tree,
+    by_name: sled::Tree,
     model: sled::Tree,
 }
 
@@ -52,11 +53,13 @@ impl Store {
             .with_context(|| format!("opening sled db at {}", path.display()))?;
         let index = db.open_tree("index")?;
         let by_parent = db.open_tree("by_parent")?;
+        let by_name = db.open_tree("by_name")?;
         let model = db.open_tree("model")?;
         Ok(Self {
             db,
             index,
             by_parent,
+            by_name,
             model,
         })
     }
@@ -75,6 +78,7 @@ impl Store {
         let bytes = bincode::serialize(entry)?;
         self.index.insert(kb, bytes)?;
         self.add_parent_link(&entry.parent, hash)?;
+        self.add_name_link(&entry.file_name, hash)?;
         Ok(())
     }
 
@@ -95,8 +99,23 @@ impl Store {
         if let Some(old) = self.index.remove(kb)? {
             let old: FileEntry = bincode::deserialize(&old)?;
             self.remove_parent_link(&old.parent, hash)?;
+            self.remove_name_link(&old.file_name, hash)?;
         }
         Ok(())
+    }
+
+    /// Exact (case-insensitive) filename lookup — the search fast path. Returns
+    /// every indexed file whose name equals `name`, without a full scan.
+    pub fn files_named(&self, name: &str) -> Result<Vec<FileEntry>> {
+        let prefix = name_prefix(name);
+        let mut out = Vec::new();
+        for kv in self.by_name.scan_prefix(&prefix) {
+            let (_, hash_bytes) = kv?;
+            if let Some(bytes) = self.index.get(&hash_bytes)? {
+                out.push(bincode::deserialize(&bytes)?);
+            }
+        }
+        Ok(out)
     }
 
     pub fn touch_open(&self, path: &str, now: i64) -> Result<Option<FileEntry>> {
@@ -164,10 +183,30 @@ impl Store {
         self.by_parent.remove(key)?;
         Ok(())
     }
+
+    fn add_name_link(&self, name: &str, hash: u64) -> Result<()> {
+        let mut key = name_prefix(name);
+        key.extend_from_slice(&key_bytes(hash));
+        self.by_name.insert(key, key_bytes(hash).to_vec())?;
+        Ok(())
+    }
+
+    fn remove_name_link(&self, name: &str, hash: u64) -> Result<()> {
+        let mut key = name_prefix(name);
+        key.extend_from_slice(&key_bytes(hash));
+        self.by_name.remove(key)?;
+        Ok(())
+    }
 }
 
 fn parent_prefix(parent: &str) -> Vec<u8> {
     let mut v = parent.to_lowercase().into_bytes();
+    v.push(0u8);
+    v
+}
+
+fn name_prefix(name: &str) -> Vec<u8> {
+    let mut v = name.to_lowercase().into_bytes();
     v.push(0u8);
     v
 }

@@ -17,6 +17,33 @@ NeuralFS is three things in one daemon:
 
 A small CLI (`nfs`) drives it all over a Windows named pipe.
 
+## Build variants (4 binaries)
+
+NeuralFS ships as three named variants from one shared codebase (the brand is
+passed into a shared `entry()` at runtime, so the variants never duplicate
+logic — they differ only in which mount compiles in):
+
+| Variant | Binary | Targets | Native mount |
+|---|---|---|---|
+| **NeuralFS Cross** | `neuralfs-cross` | ELF **and** PE | FUSE on Linux; none on Windows (portable, GPL-free) |
+| **NeuralFS Windows** | `neuralfs-windows` | PE | WinFsp kernel drive-letter mount + Windows tuning |
+| **NeuralFS Linux** | `neuralfs-linux` | ELF | FUSE (`fuse.ko`) VFS mount + Linux tuning |
+
+```sh
+cargo build --release -p neuralfs-cross               # portable (ELF or PE per host)
+cargo build --release -p neuralfs-linux               # Linux/ELF, needs fuse3
+cargo build --release -p neuralfs-windows             # Windows/PE, needs WinFsp SDK + libclang
+./target/release/neuralfs-cross --version             # -> "NeuralFS Cross 0.1.0"
+```
+
+> **On "in-kernel" Linux.** NeuralFS Linux uses FUSE, and that *is* the
+> in-kernel-driver path on Linux: `fuse.ko` is a real kernel module in mainline
+> Linux. FUSE keeps the **filesystem logic** in userspace, which is exactly what
+> lets the Linux variant reuse the CoW engine, the AI, and the caches, and stay
+> crash-safe (a bug can't panic the kernel). A "pure" in-kernel FS would be a
+> from-scratch C kernel module that could reuse none of that and could panic the
+> kernel — so FUSE is the deliberate choice, not a fallback.
+
 ## Workspace layout
 
 ```
@@ -69,6 +96,12 @@ A genuine copy-on-write object filesystem, usable through `nfs fs ...`:
 - **Transparent dedup** — identical blocks (across files *and* within a file)
   are stored once; `nfs fs info` reports the live dedup ratio.
 - **Scrub** — `nfs fs scrub` walks and re-verifies every block's checksum.
+- **Small-file fast path (inline data)** — files at or below 4 KiB are stored
+  **directly in the inode**, skipping the block store entirely: no blake3 hash,
+  no blocks-tree lookup/insert, no `data.log` append. (This is what ext4/Btrfs/
+  NTFS do for tiny "resident" files.) Verified: a ≤4 KiB file uses **zero**
+  blocks. This speeds up the engine / `nfs fs` for small files; it does *not*
+  apply to the FUSE passthrough, which writes to backing files, not the engine.
 - **Speed** — append-only block log + the RAM cache below. Honest `nfs bench 64`
   on this machine: **~258 MB/s write to disk** (CoW + blake3 + sled metadata,
   competitive with raw ext4's ~226 MB/s while doing strictly more work), and
@@ -125,14 +158,26 @@ access-driven learning — NeuralFS becomes the smart search layer over your fil
 ### 2. User-mode filesystem mount (FUSE — Linux/WSL)
 
 ```sh
-cargo build --release --features fuse
-neuralfs --mount /mnt/nfs --backing /data/store --cache-mb 1024
+cargo build --release -p neuralfs-linux        # or: --features fuse
+neuralfs-linux --mount /mnt/nfs --backing /data/store --cache-mb 1024
 ```
 
-This is a **real user-mode filesystem**: the OS routes file I/O for everything
-under `/mnt/nfs` through the NeuralFS daemon. Metadata operations pass through to
-the backing directory at native speed; file reads go through the 1 GiB
-frequency-aware cache, so a file opened often enough is served from RAM.
+This is a **real filesystem** routed through the in-kernel `fuse.ko` driver: the
+OS sends file I/O for everything under `/mnt/nfs` to the NeuralFS daemon.
+Metadata operations pass through to the backing directory at native speed; file
+reads go through the 1 GiB frequency-aware cache, so a file opened often enough
+is served from RAM.
+
+**Tuned for throughput.** The mount enables FUSE **writeback caching**
+(`FUSE_WRITEBACK_CACHE`), keeps the kernel page cache across opens
+(`FOPEN_KEEP_CACHE`), and raises `max_write`/`max_readahead` to 1 MiB. Net effect
+in a privileged Linux container: sequential write went from **66 MB/s → 191 MB/s
+(~2.9×)**. Honest caveat: writeback caching helps *throughput* (big writes), not
+metadata-heavy *small-file* create/open/close, which stay bound by per-file
+kernel↔userspace round trips (and are noisy run-to-run). The only thing that
+removes that round-trip tax is an in-kernel module — a deliberate non-goal here,
+since it would abandon the engine, AI, and crash-safety (see the variants note
+above).
 
 **Measured in a clean WSL2 VM** (passthrough over ext4):
 
@@ -244,23 +289,23 @@ nfs fs scrub                 # verify every block checksum
 nfs bench [MiB]              # virtual-fs write/read throughput (default 64)
 ```
 
-## Daemon lifecycle (Windows)
+## Daemon lifecycle
+
+Any variant binary (`neuralfs-cross` / `neuralfs-windows` / `neuralfs-linux`)
+takes the same flags; substitute the one you built:
 
 ```sh
-neuralfs.exe                 # run in foreground (index + search + AI + CoW volume)
-neuralfs.exe --install       # register a logon startup task (Task Scheduler)
-neuralfs.exe --uninstall
-```
+neuralfs-cross                  # run in foreground (index + search + AI + CoW volume)
+neuralfs-cross --version        # print the variant brand + version
+neuralfs-cross --install        # Windows: register a logon startup task (Task Scheduler)
+neuralfs-cross --uninstall
 
-Platform-specific mount modes (feature-gated, so the default build is untouched):
+# NeuralFS Linux (ELF, fuse): in-kernel-fuse.ko mount, FS logic in userspace
+neuralfs-linux --mount <mountpoint> --backing <dir> [--cache-mb 1024]
 
-```sh
-# Linux/WSL, built --features fuse: passthrough caching mount
-neuralfs --mount <mountpoint> --backing <dir> [--cache-mb 1024]
-
-# Windows, built --features winfsp: real drive-letter mount via the WinFsp driver
-neuralfs --mount-winfsp N:
-neuralfs --winfsp-probe          # confirm the WinFsp driver/library is reachable
+# NeuralFS Windows (PE, winfsp): real drive-letter mount via the WinFsp driver
+neuralfs-windows --mount-winfsp N:
+neuralfs-windows --winfsp-probe   # confirm the WinFsp driver/library is reachable
 ```
 
 State lives under `%APPDATA%/neuralfs/`:
@@ -274,6 +319,18 @@ neuralfs.log
 
 ## Design notes / deviations
 
+- **Variant structure.** One shared codebase: `neuralfs-daemon` is a *library*
+  exposing `entry(brand)`, and three tiny binary crates (`neuralfs-cross/
+  -windows/-linux`) each call it with their brand and pull in the right mount
+  feature. The brand is passed at runtime (not a compile-time feature) on
+  purpose — Cargo unifies a shared lib's features across crates built together,
+  which would otherwise collapse a feature-derived brand to one value. Platform
+  variants are excluded from `default-members` so a plain `cargo build` never
+  tries to compile WinFsp (needs the SDK) or `fuser` (Linux) on the wrong host.
+- **Search exact-match fast path.** The index keeps a `by_name` tree
+  (lowercased filename → paths). A `find` whose query is exactly an indexed
+  filename returns straight from it — no classifier, no scan. This is the
+  "drop the AI when a trivial exact match wins" shortcut.
 - **Classifier** is a from-scratch TF-IDF + gradient-descent softmax regression
   on `ndarray` (not `linfa`) — small dependency tree, trains in milliseconds at
   the capped vocab/sample sizes, and supports cheap online SGD updates.

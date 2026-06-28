@@ -1,0 +1,17 @@
+[package]
+name = "neuralfs-linux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "NeuralFS Linux (ELF) — FUSE VFS mount + Linux tuning."
+
+[[bin]]
+name = "neuralfs-linux"
+path = "src/main.rs"
+
+# Linux-only variant: the fuse feature pulls the Linux `fuser` binding. Excluded
+# from the workspace default-members so a Windows host build never tries it;
+# build it on Linux with `cargo build -p neuralfs-linux`.
+[dependencies]
+neuralfs-daemon = { path = "../neuralfs-daemon", default-features = false, features = ["fuse"] }

@@ -82,9 +82,21 @@ fn run_mount_mode(args: &[String], mountpoint: &str) {
     }
 }
 
-#[tokio::main]
-async fn main() {
+/// Shared entry point for every build variant (cross / windows / linux). Each
+/// variant binary is a one-line `fn main() { neuralfs_daemon::entry("NeuralFS X") }`.
+///
+/// The brand is passed in from the *binary* crate rather than read from a
+/// compile-time feature, so it stays correct even when several variants are
+/// built in one `cargo` invocation (Cargo unifies the shared daemon-lib's
+/// features across them, which would otherwise collapse a feature-derived
+/// brand to a single value). Which *mount* compiles in is still feature-gated.
+pub fn entry(variant: &str) {
     let args: Vec<String> = std::env::args().collect();
+
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("{variant} {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
 
     if args.iter().any(|a| a == "--install") {
         if let Err(e) = install::install() {
@@ -143,14 +155,27 @@ async fn main() {
         }
     }
 
-    if let Err(e) = run().await {
-        log::error!("fatal startup error: {e:#}");
-        eprintln!("neuralfs failed to start: {e:#}");
-        std::process::exit(1);
-    }
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("failed to start async runtime: {e}");
+            std::process::exit(1);
+        }
+    };
+    let variant = variant.to_string();
+    runtime.block_on(async move {
+        if let Err(e) = run(&variant).await {
+            log::error!("fatal startup error: {e:#}");
+            eprintln!("{variant} failed to start: {e:#}");
+            std::process::exit(1);
+        }
+    });
 }
 
-async fn run() -> Result<()> {
+async fn run(variant: &str) -> Result<()> {
     let dir = data_dir();
     std::fs::create_dir_all(&dir)?;
 
@@ -158,7 +183,7 @@ async fn run() -> Result<()> {
     let config = Config::load_or_create(&config_path)?;
 
     logging::init(&dir.join("neuralfs.log"), logging::level_from_str(&config.log_level))?;
-    log::info!("neuralfs daemon starting, data dir = {}", dir.display());
+    log::info!("{variant} daemon starting, data dir = {}", dir.display());
 
     let store = Arc::new(Store::open(&dir.join("index.db"))?);
     let vfs = Arc::new(Filesystem::open(&dir.join("volume"))?);

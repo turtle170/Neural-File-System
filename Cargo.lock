@@ -739,6 +739,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "neuralfs-cross"
+version = "0.1.0"
+dependencies = [
+ "neuralfs-daemon",
+]
+
+[[package]]
 name = "neuralfs-daemon"
 version = "0.1.0"
 dependencies = [
@@ -776,6 +783,20 @@ dependencies = [
  "parking_lot 0.12.5",
  "serde",
  "sled",
+]
+
+[[package]]
+name = "neuralfs-linux"
+version = "0.1.0"
+dependencies = [
+ "neuralfs-daemon",
+]
+
+[[package]]
+name = "neuralfs-windows"
+version = "0.1.0"
+dependencies = [
+ "neuralfs-daemon",
 ]
 
 [[package]]

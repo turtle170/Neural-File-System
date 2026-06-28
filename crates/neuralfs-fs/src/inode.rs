@@ -11,7 +11,14 @@ use crate::blockstore::Hash;
 pub enum Inode {
     File {
         size: u64,
+        /// Content-addressed blocks (empty when the file is stored inline).
         blocks: Vec<Hash>,
+        /// Small-file fast path: bytes for files at or below the inline
+        /// threshold live directly in the inode, skipping the block store
+        /// (no blake3 hashing, no blocks tree, no data.log append) entirely.
+        /// Mutually exclusive with `blocks` being non-empty.
+        #[serde(default)]
+        inline: Vec<u8>,
         mtime: i64,
         mode: u32,
     },

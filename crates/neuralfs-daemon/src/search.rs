@@ -22,6 +22,29 @@ pub fn find(
     let mut visited = HashSet::new();
     let mut hits: Vec<(FileEntry, f64)> = Vec::new();
 
+    // Fast path: if the query is exactly a filename we have indexed, return it
+    // straight from the name index — no classifier, no scan. This is the
+    // "drop the AI when a trivial exact match wins" shortcut.
+    let q_trim = query.trim();
+    if !q_trim.is_empty() {
+        if let Ok(named) = store.files_named(q_trim) {
+            if !named.is_empty() {
+                let mut results: Vec<ScoredPath> = named
+                    .into_iter()
+                    .map(|entry| ScoredPath {
+                        score: scorer::score(entry.freq, entry.last_open, now, lambda, 1.0),
+                        path: entry.path,
+                    })
+                    .collect();
+                results.sort_by(|a, b| {
+                    b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                results.truncate(max_results);
+                return results;
+            }
+        }
+    }
+
     if classifier.is_trained() {
         for (dir, confidence) in classifier.predict_top3(query) {
             let mut current = PathBuf::from(&dir);

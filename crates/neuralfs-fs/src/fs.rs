@@ -15,6 +15,9 @@ use crate::inode::{Inode, Stat, SuperBlock};
 pub const DEFAULT_CACHE_BYTES: u64 = 1024 * 1024 * 1024;
 /// Number of (immutable) inodes kept hot in RAM to avoid sled reads.
 const INODE_CACHE_ENTRIES: usize = 65_536;
+/// Files at or below this size are stored inline in the inode (small-file fast
+/// path) instead of as content-addressed blocks. 4 KiB matches a typical page.
+pub const INLINE_MAX: usize = 4096;
 
 /// A lightweight copy-on-write, content-addressed filesystem.
 ///
@@ -100,10 +103,18 @@ impl Filesystem {
         if comps.is_empty() {
             bail!("cannot write to root");
         }
-        let mut block_hashes = Vec::new();
-        for chunk in data.chunks(BLOCK_SIZE).filter(|c| !c.is_empty()) {
-            block_hashes.push(self.blocks.put(chunk)?);
-        }
+
+        // Small-file fast path: store the bytes directly in the inode and skip
+        // the block store (no blake3, no blocks tree, no data.log append).
+        let (blocks, inline) = if data.len() <= INLINE_MAX {
+            (Vec::new(), data.to_vec())
+        } else {
+            let mut block_hashes = Vec::new();
+            for chunk in data.chunks(BLOCK_SIZE).filter(|c| !c.is_empty()) {
+                block_hashes.push(self.blocks.put(chunk)?);
+            }
+            (block_hashes, Vec::new())
+        };
 
         let mut state = self.state.lock();
         let file_id = alloc(&mut state);
@@ -111,7 +122,8 @@ impl Filesystem {
             file_id,
             &Inode::File {
                 size: data.len() as u64,
-                blocks: block_hashes,
+                blocks,
+                inline,
                 mtime: now(),
                 mode: 0o644,
             },
@@ -124,7 +136,16 @@ impl Filesystem {
     pub fn read_file(&self, path: &str) -> Result<Vec<u8>> {
         let id = self.resolve(path)?;
         match self.read_inode(id)? {
-            Inode::File { size, blocks, .. } => {
+            Inode::File {
+                size,
+                blocks,
+                inline,
+                ..
+            } => {
+                if blocks.is_empty() {
+                    // Inline (or empty) file: bytes live in the inode.
+                    return Ok(inline);
+                }
                 let mut out = Vec::with_capacity(size as usize);
                 for h in &blocks {
                     out.extend_from_slice(&self.blocks.get(h)?);
@@ -499,6 +520,35 @@ mod tests {
         fs.write_file("/f", b"one").unwrap();
         fs.write_file("/f", b"two-longer").unwrap();
         assert_eq!(fs.read_file("/f").unwrap(), b"two-longer");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn small_files_are_inlined_not_blocked() {
+        let dir = tmp();
+        let fs = Filesystem::open(&dir).unwrap();
+        // A small file (<= INLINE_MAX) must read back correctly...
+        let small = vec![0xABu8; INLINE_MAX];
+        fs.write_file("/small.bin", &small).unwrap();
+        assert_eq!(fs.read_file("/small.bin").unwrap(), small);
+        // ...and must NOT have touched the block store at all.
+        assert_eq!(
+            fs.info().unwrap().unique_blocks,
+            0,
+            "small file should be inline, not stored as blocks"
+        );
+
+        // A file just over the threshold uses blocks as before.
+        let big = vec![0xCDu8; INLINE_MAX + 1];
+        fs.write_file("/big.bin", &big).unwrap();
+        assert_eq!(fs.read_file("/big.bin").unwrap(), big);
+        assert!(fs.info().unwrap().unique_blocks > 0);
+
+        // Growing past the threshold then shrinking back round-trips both ways.
+        fs.write_file("/g", &vec![1u8; INLINE_MAX + 100]).unwrap();
+        assert_eq!(fs.read_file("/g").unwrap().len(), INLINE_MAX + 100);
+        fs.write_file("/g", b"tiny").unwrap();
+        assert_eq!(fs.read_file("/g").unwrap(), b"tiny");
         std::fs::remove_dir_all(&dir).ok();
     }
 
