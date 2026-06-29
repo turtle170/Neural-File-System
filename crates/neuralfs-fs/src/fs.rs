@@ -283,6 +283,82 @@ impl Filesystem {
         self.blocks.scrub()
     }
 
+    /// Reclaim orphaned block storage left behind by overwritten or deleted
+    /// files — the long-term-growth fix. Builds the set of blocks still reachable
+    /// from the live root *and every snapshot root* (snapshots pin old data, so
+    /// they must count as GC roots), then compacts the data log down to just
+    /// those. Returns what was freed.
+    ///
+    /// Stop-the-world: run when the filesystem is quiescent (no concurrent
+    /// `write_file`). See [`BlockStore::compact`] for the locking/crash model.
+    pub fn gc(&self) -> Result<GcReport> {
+        let live = self.collect_live_blocks()?;
+        let stats = self.blocks.compact(&live)?;
+        self.db.flush()?;
+        Ok(GcReport {
+            kept_blocks: stats.kept_blocks,
+            dropped_blocks: stats.dropped_blocks,
+            bytes_reclaimed: stats.bytes_reclaimed,
+        })
+    }
+
+    /// Run [`gc`](Self::gc) only if the orphaned fraction of the log exceeds
+    /// `max_unused` (e.g. `0.05` tolerates 5% dead data before bothering to
+    /// rewrite, mirroring `restic prune --max-unused`). Cheap to call often;
+    /// returns `None` when there's too little to reclaim to be worth it.
+    pub fn maybe_gc(&self, max_unused: f64) -> Result<Option<GcReport>> {
+        let info = self.info()?;
+        if info.physical_total == 0 {
+            return Ok(None);
+        }
+        let unused = info.reclaimable_bytes as f64 / info.physical_total as f64;
+        if unused <= max_unused {
+            return Ok(None);
+        }
+        Ok(Some(self.gc()?))
+    }
+
+    fn collect_live_blocks(&self) -> Result<std::collections::HashSet<crate::blockstore::Hash>> {
+        let mut live = std::collections::HashSet::new();
+        let mut visited = std::collections::HashSet::new();
+        let mut roots = vec![self.state.lock().root];
+        for kv in self.snapshots.iter() {
+            let (_, v) = kv?;
+            let st: SuperBlock = bincode::deserialize(&v)?;
+            roots.push(st.root);
+        }
+        for r in roots {
+            self.walk_blocks(r, &mut visited, &mut live)?;
+        }
+        Ok(live)
+    }
+
+    fn walk_blocks(
+        &self,
+        id: u64,
+        visited: &mut std::collections::HashSet<u64>,
+        live: &mut std::collections::HashSet<crate::blockstore::Hash>,
+    ) -> Result<()> {
+        // CoW means snapshots share inodes; the visited guard keeps the walk
+        // O(unique inodes) instead of O(snapshots × tree).
+        if !visited.insert(id) {
+            return Ok(());
+        }
+        match self.read_inode(id)? {
+            Inode::File { blocks, .. } => {
+                for h in blocks {
+                    live.insert(h);
+                }
+            }
+            Inode::Dir { entries, .. } => {
+                for c in entries.values() {
+                    self.walk_blocks(*c, visited, live)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn info(&self) -> Result<FsInfo> {
         let state = *self.state.lock();
         let mut logical = 0u64;
@@ -449,6 +525,14 @@ impl Filesystem {
     }
 }
 
+/// Outcome of a [`Filesystem::gc`] run.
+#[derive(Debug, Clone, Copy)]
+pub struct GcReport {
+    pub kept_blocks: usize,
+    pub dropped_blocks: usize,
+    pub bytes_reclaimed: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct FsInfo {
     pub txg: u64,
@@ -520,6 +604,60 @@ mod tests {
         fs.write_file("/f", b"one").unwrap();
         fs.write_file("/f", b"two-longer").unwrap();
         assert_eq!(fs.read_file("/f").unwrap(), b"two-longer");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn gc_reclaims_orphans_keeps_live_and_snapshots() {
+        let dir = tmp();
+        let fs = Filesystem::open(&dir).unwrap();
+
+        // Distinct (non-deduping) multi-block content via a per-seed xorshift.
+        let blob = |seed: u64, n: usize| -> Vec<u8> {
+            let mut s = seed | 1;
+            (0..n)
+                .map(|_| {
+                    s ^= s << 13;
+                    s ^= s >> 7;
+                    s ^= s << 17;
+                    (s & 0xff) as u8
+                })
+                .collect()
+        };
+        let sz = 200 * 1024; // > BLOCK_SIZE, so several blocks each
+
+        // /a: written then overwritten -> the first version's blocks are orphans.
+        fs.write_file("/a", &blob(1, sz)).unwrap();
+        let a_v2 = blob(2, sz);
+        fs.write_file("/a", &a_v2).unwrap();
+
+        // /b: captured in snapshot s1, then overwritten. s1 pins the old blocks.
+        let b_v1 = blob(3, sz);
+        fs.write_file("/b", &b_v1).unwrap();
+        fs.snapshot("s1").unwrap();
+        let b_v2 = blob(4, sz);
+        fs.write_file("/b", &b_v2).unwrap();
+
+        assert!(
+            fs.info().unwrap().reclaimable_bytes > 0,
+            "expected orphaned bytes before gc"
+        );
+
+        let report = fs.gc().unwrap();
+        assert!(report.dropped_blocks > 0, "gc should drop /a's old blocks");
+        assert!(report.bytes_reclaimed > 0);
+
+        // Live content survives and still passes its integrity check on read.
+        assert_eq!(fs.read_file("/a").unwrap(), a_v2);
+        assert_eq!(fs.read_file("/b").unwrap(), b_v2);
+
+        // Running gc again with nothing changed must drop nothing (idempotent).
+        assert_eq!(fs.gc().unwrap().dropped_blocks, 0);
+
+        // The snapshot's pinned data was NOT collected: rollback restores old /b.
+        fs.rollback("s1").unwrap();
+        assert_eq!(fs.read_file("/b").unwrap(), b_v1);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 

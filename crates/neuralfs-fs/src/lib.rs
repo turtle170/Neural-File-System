@@ -10,5 +10,5 @@ mod inode;
 
 pub use blockstore::{hash_hex, Hash, BLOCK_SIZE};
 pub use cache::{CacheStats, RamCache};
-pub use fs::{Filesystem, FsInfo, DEFAULT_CACHE_BYTES};
+pub use fs::{Filesystem, FsInfo, GcReport, DEFAULT_CACHE_BYTES};
 pub use inode::{Inode, Stat, SuperBlock};

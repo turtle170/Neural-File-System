@@ -195,54 +195,29 @@ async fn run(variant: &str) -> Result<()> {
         config_path,
     ));
 
-    // Initial full re-index on startup.
-    {
-        let store = store.clone();
-        let roots = config.root_dirs.clone();
-        let count = tokio::task::spawn_blocking(move || {
-            let idx = indexer::Indexer::new(&store);
-            idx.reindex_all(&roots).unwrap_or(0)
-        })
-        .await
-        .unwrap_or(0);
-        log::info!("initial index complete: {count} files");
-    }
-
-    // Load a persisted model if present, otherwise train from scratch.
-    {
+    // Load any persisted model synchronously — it's just a deserialize, so the
+    // AI is ready immediately when one exists. The expensive initial re-index is
+    // deferred to a background task (below) instead of being awaited here, so the
+    // IPC server starts serving within ~1s even when `root_dirs` is a huge tree
+    // (e.g. the whole home directory) rather than blocking the pipe for minutes.
+    let had_model = {
         let loaded = store
             .load_model()
             .ok()
             .flatten()
             .and_then(|bytes| bincode::deserialize::<Classifier>(&bytes).ok())
             .filter(|c| c.is_trained());
-
-        let clf = match loaded {
-            Some(c) => {
+        match loaded {
+            Some(clf) => {
                 log::info!("loaded persisted classifier model");
-                c
+                state.saved_version.store(clf.version(), Ordering::SeqCst);
+                *state.classifier.write().await = clf;
+                *state.last_retrain.write().await = Some(chrono::Local::now().to_rfc2822());
+                true
             }
-            None => {
-                let store_for_train = store.clone();
-                let trained = tokio::task::spawn_blocking(move || {
-                    let entries = store_for_train.all_entries().unwrap_or_default();
-                    Classifier::train(&entries)
-                })
-                .await
-                .ok()
-                .and_then(|r| r.ok())
-                .unwrap_or_default();
-                if let Ok(bytes) = bincode::serialize(&trained) {
-                    let _ = store.save_model(&bytes);
-                }
-                log::info!("trained initial classifier model");
-                trained
-            }
-        };
-        state.saved_version.store(clf.version(), Ordering::SeqCst);
-        *state.classifier.write().await = clf;
-        *state.last_retrain.write().await = Some(chrono::Local::now().to_rfc2822());
-    }
+            None => false,
+        }
+    };
 
     let (retrain_tx, retrain_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
@@ -258,6 +233,49 @@ async fn run(variant: &str) -> Result<()> {
     tokio::spawn(periodic_flush(store.clone(), state.vfs.clone()));
     tokio::spawn(ai_checkpoint_loop(state.clone()));
     tokio::spawn(path_cache_sweeper(state.clone()));
+
+    // Initial full re-index, in the background. When it completes: if there was
+    // no persisted model, train the first one from what got indexed; if there
+    // was, nudge a retrain so the loaded model picks up the freshly-indexed
+    // files. Until it finishes, `find`/`open` still work (exact-name fast path +
+    // recency scorer); only classifier ranking warms up a moment later.
+    {
+        let store = store.clone();
+        let state = state.clone();
+        let roots = config.root_dirs.clone();
+        let retrain_tx = retrain_tx.clone();
+        tokio::spawn(async move {
+            let store_for_index = store.clone();
+            let count = tokio::task::spawn_blocking(move || {
+                let idx = indexer::Indexer::new(&store_for_index);
+                idx.reindex_all(&roots).unwrap_or(0)
+            })
+            .await
+            .unwrap_or(0);
+            log::info!("initial index complete: {count} files");
+
+            if had_model {
+                let _ = retrain_tx.send(());
+            } else {
+                let store_for_train = store.clone();
+                let trained = tokio::task::spawn_blocking(move || {
+                    let entries = store_for_train.all_entries().unwrap_or_default();
+                    Classifier::train(&entries)
+                })
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or_default();
+                if let Ok(bytes) = bincode::serialize(&trained) {
+                    let _ = store.save_model(&bytes);
+                }
+                state.saved_version.store(trained.version(), Ordering::SeqCst);
+                *state.classifier.write().await = trained;
+                *state.last_retrain.write().await = Some(chrono::Local::now().to_rfc2822());
+                log::info!("trained initial classifier model");
+            }
+        });
+    }
 
     ipc::run_server(state.clone(), retrain_tx).await?;
     Ok(())

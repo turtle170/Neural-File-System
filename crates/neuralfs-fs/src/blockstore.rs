@@ -1,6 +1,7 @@
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -42,6 +43,15 @@ pub struct BlockStore {
     log: Mutex<DataLog>,
     index: sled::Tree,
     cache: Mutex<RamCache<Hash>>,
+    data_path: PathBuf,
+}
+
+/// What a [`BlockStore::compact`] run did.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CompactStats {
+    pub kept_blocks: usize,
+    pub dropped_blocks: usize,
+    pub bytes_reclaimed: u64,
 }
 
 impl BlockStore {
@@ -58,6 +68,7 @@ impl BlockStore {
             log: Mutex::new(DataLog { file, len }),
             index,
             cache: Mutex::new(RamCache::new(cache_bytes)),
+            data_path: data_path.to_path_buf(),
         })
     }
 
@@ -170,6 +181,116 @@ impl BlockStore {
         let log = self.log.lock();
         log.file.sync_data()?;
         Ok(())
+    }
+
+    /// Garbage-collect the data log: rewrite it keeping only the blocks whose
+    /// hashes are in `live`, dropping the rest (orphans left by overwritten or
+    /// deleted files). This is what bounds long-term on-disk growth — without
+    /// it the append-only log only ever gets bigger.
+    ///
+    /// **Stop-the-world.** It holds the log lock for the whole rewrite, so block
+    /// reads/writes block until it finishes, and it must be called while the
+    /// filesystem is otherwise quiescent (no in-flight `write_file`): a block
+    /// written but not yet reachable from a committed root would not be in
+    /// `live` and would be dropped. The daemon runs it from a maintenance path
+    /// for exactly this reason (mirrors how `restic prune` locks the repo).
+    ///
+    /// Crash model: the compacted image is written to a side file and fsync'd
+    /// before the original is replaced and the index rewritten. A crash in the
+    /// brief replace/index-update window leaves integrity-checked reads to
+    /// detect any mismatch (every `get` re-hashes); it is not silently wrong.
+    pub fn compact(&self, live: &HashSet<Hash>) -> Result<CompactStats> {
+        let mut log = self.log.lock();
+
+        // Snapshot the current index: (hash, data_offset, len).
+        let mut entries: Vec<(Hash, u64, u32)> = Vec::new();
+        for kv in self.index.iter() {
+            let (k, v) = kv?;
+            if k.len() != 32 {
+                continue;
+            }
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&k);
+            let (off, len) = dec(&v);
+            entries.push((h, off, len));
+        }
+
+        let tmp_path = self.data_path.with_extension("compact.tmp");
+        let mut tmp = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(true)
+            .open(&tmp_path)
+            .with_context(|| format!("creating compaction temp {}", tmp_path.display()))?;
+
+        let mut new_index: Vec<(Hash, [u8; 12])> = Vec::new();
+        let mut drop_keys: Vec<Hash> = Vec::new();
+        let mut new_len: u64 = 0;
+        let mut stats = CompactStats::default();
+
+        for (h, off, len) in &entries {
+            if live.contains(h) {
+                // Copy the live block's record into the new log.
+                let mut buf = vec![0u8; *len as usize];
+                log.file.seek(SeekFrom::Start(*off))?;
+                log.file.read_exact(&mut buf)?;
+                let data_offset = new_len + 4;
+                let mut record = Vec::with_capacity(4 + buf.len());
+                record.extend_from_slice(&(*len).to_le_bytes());
+                record.extend_from_slice(&buf);
+                tmp.write_all(&record)?;
+                new_len += record.len() as u64;
+                new_index.push((*h, enc(data_offset, *len)));
+                stats.kept_blocks += 1;
+            } else {
+                drop_keys.push(*h);
+                stats.dropped_blocks += 1;
+                stats.bytes_reclaimed += *len as u64;
+            }
+        }
+        tmp.sync_all()?;
+        drop(tmp); // close so the source isn't open across the rename
+
+        // Replace the old log with the compacted one. The old handle must be
+        // closed before the rename (required on Windows); a tiny placeholder
+        // keeps the guard's `file` field valid across the swap.
+        let placeholder = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(self.data_path.with_extension("swap"))?;
+        let old = std::mem::replace(&mut log.file, placeholder);
+        drop(old);
+        std::fs::rename(&tmp_path, &self.data_path)
+            .with_context(|| "swapping compacted data log into place")?;
+        let new_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&self.data_path)?;
+        log.file = new_file; // drops the placeholder handle
+        log.len = new_len;
+        let _ = std::fs::remove_file(self.data_path.with_extension("swap"));
+
+        // Rewrite the index to the new offsets and drop the orphans atomically.
+        let mut batch = sled::Batch::default();
+        for (h, packed) in &new_index {
+            batch.insert(&h[..], &packed[..]);
+        }
+        for h in &drop_keys {
+            batch.remove(&h[..]);
+        }
+        self.index.apply_batch(batch)?;
+
+        // Evict dropped blocks from the RAM cache (live blocks keep their cached
+        // bytes — content is unchanged, only the on-disk offset moved).
+        {
+            let mut cache = self.cache.lock();
+            for h in &drop_keys {
+                cache.invalidate(h);
+            }
+        }
+        Ok(stats)
     }
 
     pub fn len_for(&self, hash: &Hash) -> Result<u32> {

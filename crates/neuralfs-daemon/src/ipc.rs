@@ -215,6 +215,9 @@ async fn handle_request(
             };
             let vfs = state.vfs.clone();
             let n = bytes.len();
+            // Read side of the GC gate: writes run concurrently with each other
+            // but never overlap a stop-the-world `fs gc`.
+            let _gate = state.fs_gate.read().await;
             let res = tokio::task::spawn_blocking(move || vfs.write_file(&path, &bytes)).await;
             match res {
                 Ok(Ok(())) => Response::ok(format!("wrote {n} bytes")),
@@ -320,6 +323,21 @@ async fn handle_request(
                     }
                     lines(out)
                 }
+                Ok(Err(e)) => Response::error(e.to_string()),
+                Err(e) => Response::error(format!("task error: {e}")),
+            }
+        }
+        Request::FsGc => {
+            let vfs = state.vfs.clone();
+            // Write side of the gate: block new volume writes for the duration
+            // of the stop-the-world compaction so nothing is dropped mid-write.
+            let _gate = state.fs_gate.write().await;
+            match tokio::task::spawn_blocking(move || vfs.gc()).await {
+                Ok(Ok(r)) => lines(vec![
+                    format!("blocks kept:        {}", r.kept_blocks),
+                    format!("blocks dropped:     {}", r.dropped_blocks),
+                    format!("bytes reclaimed:    {}", r.bytes_reclaimed),
+                ]),
                 Ok(Err(e)) => Response::error(e.to_string()),
                 Err(e) => Response::error(format!("task error: {e}")),
             }

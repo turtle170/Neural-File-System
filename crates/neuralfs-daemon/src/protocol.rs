@@ -22,6 +22,7 @@ pub enum Request {
     FsSnapshots,
     FsRollback { name: String },
     FsScrub,
+    FsGc,
     // Hook the daemon onto a real directory of the user's filesystem.
     Hook { dir: String },
     HookStatus,

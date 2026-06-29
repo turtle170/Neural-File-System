@@ -27,6 +27,7 @@ pub enum Request {
     FsSnapshots,
     FsRollback { name: String },
     FsScrub,
+    FsGc,
     Hook { dir: String },
     HookStatus,
     Ai,

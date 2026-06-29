@@ -90,6 +90,8 @@ enum FsAction {
     Rollback { name: String },
     /// Verify every block's checksum (ZFS-style scrub)
     Scrub,
+    /// Reclaim storage orphaned by overwritten/deleted files (compact the log)
+    Gc,
 }
 
 #[tokio::main]
@@ -215,6 +217,7 @@ async fn run_fs(action: FsAction) -> Result<()> {
             print_message_or_error(&client::send(Request::FsRollback { name }).await?)
         }
         FsAction::Scrub => print_lines(&client::send(Request::FsScrub).await?),
+        FsAction::Gc => print_lines(&client::send(Request::FsGc).await?),
     }
     Ok(())
 }
