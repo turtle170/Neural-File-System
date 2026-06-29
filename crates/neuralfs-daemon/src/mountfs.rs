@@ -24,7 +24,21 @@ use fuser::{
 };
 use neuralfs_fs::RamCache;
 
-const TTL: Duration = Duration::from_secs(1);
+/// How long the kernel may trust a name→inode (entry) result from `lookup`
+/// before it must ask us again. Every cached second here is a `LOOKUP` upcall
+/// the kernel answers from its own dcache instead of crossing into the daemon —
+/// and the FAST'17 FUSE study showed the *count* of those metadata upcalls,
+/// not their individual cost, is what makes small-file workloads slow. Raised
+/// from the original 1 s: NeuralFS is the access path for its backing tree, so a
+/// few seconds of name-cache validity is safe. The trade-off is that changes
+/// made to the backing directory *out of band* (not through this mount) take up
+/// to this long to become visible. Note this is independent of the AI: the
+/// classifier learns from `find`/`open` IPC and the inotify watcher, never from
+/// these FUSE upcalls, so caching them harder does not blind the model.
+const ENTRY_TTL: Duration = Duration::from_secs(5);
+/// How long the kernel may trust cached attributes (`getattr`) — same reasoning
+/// and same out-of-band-staleness trade-off as [`ENTRY_TTL`].
+const ATTR_TTL: Duration = Duration::from_secs(5);
 const ROOT_INO: u64 = 1;
 /// Files at or below this size are eligible to be cached whole in RAM.
 const MAX_CACHE_FILE: u64 = 256 * 1024 * 1024;
@@ -126,6 +140,22 @@ impl Filesystem for PassthroughFs {
         // small-file / small-write workloads — it removes most of the per-write
         // kernel<->userspace round trips that make a plain FUSE passthrough slow.
         let _ = config.add_capabilities(fuser::consts::FUSE_WRITEBACK_CACHE);
+        // Let the kernel keep many more async requests in flight before it
+        // throttles us. The default ceiling is 12; raising it to 64 lets
+        // readahead and writeback pipeline deeply instead of stalling after a
+        // dozen outstanding requests — the FAST'17 study saw read workloads go
+        // from badly degraded to within ~2% of native ext4 purely by lifting
+        // this limit. The congestion threshold (the point at which the kernel
+        // starts treating the queue as congested and backs off) is kept at the
+        // usual ~75% of the background limit.
+        //
+        // Caveat, stated honestly: fuser's mount loop dispatches requests on a
+        // single thread, so this widens the *kernel-side* in-flight queue for
+        // async I/O — it is not the same as a multi-threaded handler pool.
+        // True parallel dispatch would need a different session model than
+        // fuser 0.14 exposes; that is the bigger, separate rewrite.
+        let _ = config.set_max_background(64);
+        let _ = config.set_congestion_threshold(48);
         Ok(())
     }
 
@@ -137,7 +167,7 @@ impl Filesystem for PassthroughFs {
         match std::fs::symlink_metadata(&child) {
             Ok(m) => {
                 let ino = self.ino_for(&child);
-                reply.entry(&TTL, &attr_from_meta(ino, &m), 0);
+                reply.entry(&ENTRY_TTL, &attr_from_meta(ino, &m), 0);
             }
             Err(_) => reply.error(libc::ENOENT),
         }
@@ -148,7 +178,7 @@ impl Filesystem for PassthroughFs {
             return reply.error(libc::ENOENT);
         };
         match std::fs::symlink_metadata(&p) {
-            Ok(m) => reply.attr(&TTL, &attr_from_meta(ino, &m)),
+            Ok(m) => reply.attr(&ATTR_TTL, &attr_from_meta(ino, &m)),
             Err(_) => reply.error(libc::ENOENT),
         }
     }
@@ -182,7 +212,7 @@ impl Filesystem for PassthroughFs {
             self.cache.invalidate(&ino);
         }
         match std::fs::symlink_metadata(&p) {
-            Ok(m) => reply.attr(&TTL, &attr_from_meta(ino, &m)),
+            Ok(m) => reply.attr(&ATTR_TTL, &attr_from_meta(ino, &m)),
             Err(_) => reply.error(libc::ENOENT),
         }
     }
@@ -302,7 +332,7 @@ impl Filesystem for PassthroughFs {
                 self.cache.invalidate(&ino);
                 match std::fs::symlink_metadata(&child) {
                     Ok(m) => reply.created(
-                        &TTL,
+                        &ENTRY_TTL,
                         &attr_from_meta(ino, &m),
                         0,
                         fh,
@@ -407,7 +437,7 @@ impl Filesystem for PassthroughFs {
             Ok(()) => {
                 let ino = self.ino_for(&child);
                 match std::fs::symlink_metadata(&child) {
-                    Ok(m) => reply.entry(&TTL, &attr_from_meta(ino, &m), 0),
+                    Ok(m) => reply.entry(&ENTRY_TTL, &attr_from_meta(ino, &m), 0),
                     Err(e) => reply.error(e.raw_os_error().unwrap_or(libc::EIO)),
                 }
             }

@@ -522,11 +522,24 @@ pub struct NeuralWinFs {
 
 fn build_and_mount(drive: &str) -> anyhow::Result<NeuralWinFs> {
     let mut volume_params = VolumeParams::new();
+    // Metadata cache timeouts (milliseconds). WinFsp caches these results
+    // kernel-side, so within the window a query is answered without a round
+    // trip down to this user-mode filesystem — and on Windows that round trip
+    // is two process context switches, the documented bottleneck for repeated
+    // opens and stats. This volume is fully authoritative and is only ever
+    // mutated *through* WinFsp, so caching harder cannot serve stale data from
+    // an out-of-band writer; we therefore raise these well above the original
+    // 1 s. file_info_timeout is the base; the per-class timeouts below override
+    // it for their category. The security descriptor is a fixed constant for
+    // the life of the process, so it can be cached far longer than file info.
     volume_params
         .sector_size(512)
         .sectors_per_allocation_unit(1)
         .volume_creation_time(now_filetime())
-        .file_info_timeout(1000)
+        .file_info_timeout(10_000)
+        .dir_info_timeout(10_000)
+        .volume_info_timeout(10_000)
+        .security_timeout(60_000)
         .case_sensitive_search(false)
         .case_preserved_names(true)
         .unicode_on_disk(true)
