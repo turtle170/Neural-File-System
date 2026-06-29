@@ -96,6 +96,15 @@ A genuine copy-on-write object filesystem, usable through `nfs fs ...`:
 - **Transparent dedup** — identical blocks (across files *and* within a file)
   are stored once; `nfs fs info` reports the live dedup ratio.
 - **Scrub** — `nfs fs scrub` walks and re-verifies every block's checksum.
+- **Garbage collection** — `nfs fs gc` reclaims storage orphaned by overwritten
+  or deleted files. Without it the append-only `data.log` only ever grows; GC
+  builds the set of blocks still reachable from the live root *and every snapshot
+  root* (snapshots pin data, so they count), then compacts the log down to just
+  those (restic's `forget`+`prune` model). It's stop-the-world — a daemon
+  `fs_gate` lock serializes it against writes — and integrity-checked throughout.
+  Measured in a release container: 20 overwrites of a 10 MiB file left 4,114
+  blocks of which only 160 were live; GC reclaimed all **257 MiB of orphans in
+  0.196 s (~1.3 GB/s compaction)**, bringing reclaimable bytes to zero.
 - **Small-file fast path (inline data)** — files at or below 4 KiB are stored
   **directly in the inode**, skipping the block store entirely: no blake3 hash,
   no blocks-tree lookup/insert, no `data.log` append. (This is what ext4/Btrfs/
@@ -105,7 +114,8 @@ A genuine copy-on-write object filesystem, usable through `nfs fs ...`:
 - **Speed** — append-only block log + the RAM cache below. Honest `nfs bench 64`
   on this machine: **~258 MB/s write to disk** (CoW + blake3 + sled metadata,
   competitive with raw ext4's ~226 MB/s while doing strictly more work), and
-  cache-warm reads at **~1.8 GB/s**.
+  cache-warm reads at **~1.8 GB/s**. A release `nfs bench 256` in a Linux
+  container measured **294 MB/s write / 1063 MB/s cache-warm read**.
 
 ## The 1 GiB frequency-aware RAM cache (ZFS-ARC style)
 
@@ -282,6 +292,15 @@ the daemon is alive:
   version advances, so learning survives restarts.
 - Full retrains still fire on startup, reindex, and every `retrain_threshold`
   FS events.
+- **Usage-weighted retrains (gets better over long-term use).** When the index
+  is larger than the training budget (`MAX_SAMPLES`), a retrain doesn't take a
+  positional stride (an arbitrary slice of one store snapshot) — it draws a
+  **weighted reservoir sample** (Efraimidis–Spirakis A-Res) keyed by
+  `(freq+1)·e^(−λ·age)`, the same recency/frequency shape as the runtime scorer.
+  So the model trains on a representative sample of how you *actually* use your
+  files across all history — recent habits are favoured (tracking drift) while
+  the long tail still gets sampled. This is what lets it keep *improving*, not
+  just stay bounded, the longer it runs.
 - `nfs ai` shows model version, online-update count, last-saved version,
   classes, and vocabulary size.
 
@@ -310,6 +329,7 @@ nfs fs snapshot <name>       # O(1) snapshot
 nfs fs snapshots
 nfs fs rollback <name>
 nfs fs scrub                 # verify every block checksum
+nfs fs gc                    # reclaim storage orphaned by overwrites/deletes
 
 nfs bench [MiB]              # virtual-fs write/read throughput (default 64)
 ```
@@ -332,6 +352,14 @@ neuralfs-linux --mount <mountpoint> --backing <dir> [--cache-mb 1024]
 neuralfs-windows --mount-winfsp N:
 neuralfs-windows --winfsp-probe   # confirm the WinFsp driver/library is reachable
 ```
+
+**Responsive startup.** The initial full re-index of `root_dirs` runs in the
+background, so the daemon answers commands immediately instead of blocking on it.
+Measured in a release container with `root_dirs = /usr` (~25,500 files): the IPC
+socket was up and `nfs status` answered in **0.41 s** while that index ran behind
+it. A persisted model loads synchronously, so the AI is ready at once when one
+exists; `find`/`open` work during the warm-up via the exact-name fast path and
+the recency scorer.
 
 State lives under `%APPDATA%/neuralfs/`:
 
